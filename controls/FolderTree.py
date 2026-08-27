@@ -165,8 +165,9 @@ class FolderTree(wx.Panel):
             if item_type != FILE:
                 if self.Tree.IsExpanded(item):
                     self.GenerateTreeBranch(item, filepath)
-                elif children > 0:
+                if item_type == FOLDER and children > 0:
                     self.Tree.SetItemHasChildren(item)
+                self.Tree.SetItemHasChildren(item)
             item, item_cookie = self.Tree.GetNextChild(root, item_cookie)
         to_delete = []
         while item.IsOk():
