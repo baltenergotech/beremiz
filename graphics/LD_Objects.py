@@ -193,9 +193,9 @@ class LD_PowerRail(Graphic_Element):
             if scaling is not None:
                 position = round((self.Pos.y + position) / scaling[1]) * scaling[1] - self.Pos.y
             if self.Type == LEFTRAIL:
-                connector.SetPosition(wx.Point(self.Size[0], position))
+                connector.SetPosition(wx.Point( int(self.Size[0]), int(position) ))
             elif self.Type == RIGHTRAIL:
-                connector.SetPosition(wx.Point(0, position))
+                connector.SetPosition(wx.Point(0, int(position) ))
         self.RefreshConnected()
 
     # Refresh the position of wires connected to power rail
@@ -978,19 +978,19 @@ class LD_Coil(Graphic_Element):
 
         printing = getattr(dc, "printing", False)
         # Draw a two ellipse arcs for representing the coil
-        pos = (self.Pos.x,  
-               self.Pos.y - round(self.Size[1] * (sqrt(2) - 1.) / 2.) + 1, 
+        pos = (self.Pos.x,
+               self.Pos.y - round(self.Size[1] * (sqrt(2) - 1.) / 2.) + 1,
                self.Size[0], round(self.Size[1] * sqrt(2)) - 1)
-        
+
         if printing:
             # workaround for printing bug with DrawEllipticArc
             # add an offset to the y position proportional to the height of the ellipse
             # sqrt(2) ratio obtained heuristically
             pos = (pos[0], pos[1] + round(sqrt(2)*pos[3]), pos[2], pos[3])
-            
+
         dc.DrawEllipticArc(*pos, 135, 225)
         dc.DrawEllipticArc(*pos, -45, 45)
-        
+
         name_size = self.NameSize
         if typetext != "":
             type_size = self.TypeSize
