@@ -13,9 +13,13 @@ def split_as_dict(s, sep, labels):
 def parse_tcp(loc):
     return split_as_dict(loc, ":", ["host", "port"])
 
+#def parse_sslpsk(loc):
+#    locals().update(**split_as_dict(loc, "#", ["hostport", "ID"]))
+#    return dict(**parse_tcp(hostport), ID=ID) # type: ignore
+
 def parse_sslpsk(loc):
-    locals().update(**split_as_dict(loc, "#", ["hostport", "ID"]))
-    return dict(**parse_tcp(hostport), ID=ID) # type: ignore
+    parts = split_as_dict(loc, "#", ["hostport", "ID"])
+    return dict(parse_tcp(parts["hostport"]), ID=parts["ID"])
 
 def parse_serial(loc):
     return split_as_dict(loc, "@", ["device", "baudrate"])
@@ -44,7 +48,7 @@ def build_usb(fields):
     if fields['PID']:
         return "{VID}:{PID}".format(**fields)
     return fields['VID']
-    
+
 ## Dialog fields definition
 
 model_tcp = [('host', _("Host:")),

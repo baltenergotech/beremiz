@@ -166,7 +166,7 @@ class IDBrowser(wx.Panel):
     def OnExportButton(self, evt):
         dialog = wx.FileDialog(self, _("Choose a file"),
                                wildcard=_("PSK ZIP files (*.zip)|*.zip"),
-                               style=wx.SAVE | wx.OVERWRITE_PROMPT)
+                               style=wx.FD_SAVE | wx.FD_OVERWRITE_PROMPT)
         if dialog.ShowModal() == wx.ID_OK:
             self.model.Export(dialog.GetPath())
 
