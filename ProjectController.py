@@ -286,7 +286,7 @@ class ProjectController(ConfigTreeNode, PLCControler):
         self.AppFrame = None
         self.logger = None
         self.additionalCFLAGS = []
-        
+
         self._reservedCTNInstances = []
 
     # compute CFLAGS for PLC code
@@ -340,17 +340,17 @@ class ProjectController(ConfigTreeNode, PLCControler):
                     self.CTNType = CTNClass.__name__
                     # Prevent modification of IEC_Channel and Name attributes of reserved CTNs
                     self.EditorType = type("ReservedCTNEditor", (self.EditorType,), {"SHOW_BASE_PARAMS": False})
-                    
+
             self._reservedCTNInstances.append(FinalPseudoCTNClass(self))
         return self._reservedCTNInstances
 
     def CTNAddChild(self, CTNName, CTNType, IEC_Channel=0):
-        """ 
+        """
         Project controller:
             - load reserved CTN XML configs
             - applies libraries requirements when adding new CTN
         """
-        
+
         reserved = self.GetReservedCTNs()
         for CTN in reserved:
             if CTN.CTNType == CTNType:
@@ -358,12 +358,12 @@ class ProjectController(ConfigTreeNode, PLCControler):
                     CTN.LoadXMLParams(CTNName)
                 CTN.LoadChildren()
                 return CTN
-        
+
         res = ConfigTreeNode.CTNAddChild(self, CTNName, CTNType, IEC_Channel)
 
         # find library associated with new CTN, if any
-        associated_lib = {default:libname 
-                          for libname, _clsname, default 
+        associated_lib = {default:libname
+                          for libname, _clsname, default
                           in features.libraries}.get(CTNType, None)
 
         # if any, then enable it if it wasn't and inform user
@@ -457,17 +457,17 @@ class ProjectController(ConfigTreeNode, PLCControler):
     def GetDefaultTargetName(self):
         if features.targets:
             return features.targets[0]
-        
+
         if sys.platform.startswith('linux'):
             return "Linux"
         elif sys.platform.startswith('darwin'):
             return "OSX"
         elif sys.platform.startswith('win32'):
             return "Win32"
-        
+
         # Fall back to Linux as default target
         return "Linux"
-        
+
 
     def GetTarget(self):
         target = self.BeremizRoot.getTargetType()
@@ -731,7 +731,7 @@ class ProjectController(ConfigTreeNode, PLCControler):
             # check libraries compatibility with Target
             builder = self.GetBuilder()
             if not lib.SupportsTarget(builder):
-                self.FatalError(_("Target %s is not compatible with %s library\n") % 
+                self.FatalError(_("Target %s is not compatible with %s library\n") %
                     (builder.GetTargetName(), lib.GetName()))
 
             res = lib.Generate_C(buildpath, self._VariablesList, self.getPLC_CFLAGS())
@@ -1060,7 +1060,7 @@ class ProjectController(ConfigTreeNode, PLCControler):
         builder = self.GetBuilder()
         if not hasattr(child, "SupportsTarget") or child.SupportsTarget(builder):
             return True
-        self.FatalError(_("Target %s is not compatible with %s extension\n") % 
+        self.FatalError(_("Target %s is not compatible with %s extension\n") %
                     (builder.GetTargetName(), child.CTNType))
 
     #
@@ -1232,7 +1232,7 @@ class ProjectController(ConfigTreeNode, PLCControler):
                     requirements[0] if requirements else None)
                    for loc, _Cfiles, DoCalls, *requirements in
                    self.LocationCFilesAndCFLAGS if loc and DoCalls==True]
-        
+
         plc_main_fields = {
             "calls_prototypes": "\n".join([
                 "\n".join([
@@ -1263,9 +1263,9 @@ class ProjectController(ConfigTreeNode, PLCControler):
                     req['minimum_version'])
                 if req else "EXT_NO_REQUIREMENT"
                 for _locstr, req in locreqs])
-     
+
         } if not self.BeremizRoot.getDisable_Extensions() else {
-            
+
             "calls_prototypes": "\n",
             "retrieve_calls":   "\n",
             "publish_calls":    "\n",
@@ -1284,7 +1284,7 @@ class ProjectController(ConfigTreeNode, PLCControler):
         else:
             sdk_main_code_path = os.path.join(sdk_path, "plc_main_sdk.c")
             plc_main_code += open(sdk_main_code_path, "r").read()
-        
+
         return plc_main_code
 
     def _Build(self):
@@ -1405,7 +1405,7 @@ class ProjectController(ConfigTreeNode, PLCControler):
         # files are stacked at the beginning, as files of confnode tree root
         c_source = []
         self.additionalCFLAGS = []
-        
+
         if self.GetBuilder().getDebugEnabled():
             # add debugger code
             c_source.append((self.Generate_plc_debugger, "plc_debugger.c", "Debugger"))
@@ -1743,7 +1743,7 @@ class ProjectController(ConfigTreeNode, PLCControler):
 
         return debug_status, ticks, buffers
 
-    RegisterDebugVariableErrorCodes = { 
+    RegisterDebugVariableErrorCodes = {
         # Connector only can return None
         None : _("Debug: connection problem.\n"),
         # TRACE_LIST_OVERFLOW
@@ -1777,7 +1777,7 @@ class ProjectController(ConfigTreeNode, PLCControler):
                     if Idx is not None:
                         if IEC_Type in DebugTypesSize:
                             Idxs.append(
-                                (Idx, IEC_Type, IECPath, 
+                                (Idx, IEC_Type, IECPath,
                                  ValueToIECBytes(IEC_Type, fvalue)))
                         else:
                             self.logger.write_warning(
@@ -2092,11 +2092,11 @@ class ProjectController(ConfigTreeNode, PLCControler):
             return
         # Check remote target PLC correspondance to that md5
         if self._connector.MatchMD5(MD5):
-            self.logger.write(
+            self.logger.write_warning(
                 _("Latest build matches with connected target.\n"))
             self.ProgramTransferred()
         else:
-            self.logger.write(
+            self.logger.write_warning(
                 _("Latest build does not match with connected target.\n"))
 
     def _Disconnect(self):
