@@ -104,15 +104,17 @@ class DurationCellEditor(wx.grid.GridCellEditor):
     '''
     def __init__(self, table, colname):
         wx.grid.GridCellEditor.__init__(self)
-
         self.Table = table
         self.Colname = colname
+        self.CellControl = None
+        self._evt_handler = None
 
     def Create(self, parent, id, evt_handler):
         self.CellControl = DurationCellControl(parent)
         self.SetControl(self.CellControl)
         if evt_handler:
-            self.CellControl.PushEventHandler(evt_handler)
+            self._evt_handler = evt_handler
+            self.CellControl.PushEventHandler(self._evt_handler)
 
     def BeginEdit(self, row, col, grid):
         self.CellControl.Enable()

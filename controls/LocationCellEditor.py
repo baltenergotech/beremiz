@@ -137,8 +137,7 @@ class LocationCellControl(wx.Control):
         elif keycode == wx.WXK_ESCAPE:
             self.Location.SetValue(self.Default)
             self.Parent.Parent.CloseEditControl()
-        else:
-            event.Skip()
+        event.Skip()
 
     def SetInsertionPoint(self, i):
         self.Location.SetInsertionPoint(i)
@@ -153,15 +152,35 @@ class LocationCellEditor(wx.grid.GridCellEditor):
     '''
     def __init__(self, table, controller):
         wx.grid.GridCellEditor.__init__(self)
-
         self.Table = table
         self.Controller = controller
+        self.CellControl = None
+        self._evt_handler = None
 
     def Create(self, parent, id, evt_handler):
         self.CellControl = LocationCellControl(parent)
         self.SetControl(self.CellControl)
         if evt_handler:
-            self.CellControl.PushEventHandler(evt_handler)
+            self._evt_handler = evt_handler
+            self.CellControl.PushEventHandler(self._evt_handler)
+
+    def Destroy(self):
+        """ Final cleanup
+            NOTE: There is no need to everride this if you don't need
+            to do something out of the ordinary.
+        """
+        super(LocationCellEditor, self).Destroy()
+
+    # def Destroy(self):
+    #     # Сначала снимаем обработчик, если был
+    #     if self._evt_handler is not None:
+    #         self.CellControl.PopEventHandler(True)
+    #         self._evt_handler = None
+    #     # Если контрол создавался здесь и должен удаляться — удаляем
+    #     if self.CellControl is not None:
+    #         self.CellControl.Destroy()
+    #         self.CellControl = None
+    #     return super().Destroy()
 
     def BeginEdit(self, row, col, grid):
         self.CellControl.Enable()
