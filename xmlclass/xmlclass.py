@@ -998,7 +998,7 @@ class ClassFactory(object):
             return typeinfos
         elif typeinfos["type"] == TAG:
             return self.CreateClass(name, parent, typeinfos)
-            
+
 
     def GetEquivalentParents(self, parent):
         return reduce(lambda x, y: x + y,
@@ -1006,7 +1006,7 @@ class ClassFactory(object):
                        for p in list(self.EquivalentClassesParent.get(parent, {}).keys())], [])
 
 
-    def CreatePendingClasses(self): 
+    def CreatePendingClasses(self):
         while len(self.PendingClassCreations) > 0:
             result = self.CreateClass(*self.PendingClassCreations.pop(0))
             if result is not None and \
@@ -1497,9 +1497,15 @@ def generateGetElementInfos(factory, classinfos):
                         "value": getattr(self, element_name, None)})
                 else:
                     instance = getattr(self, element_name, None)
-                    if instance is None:
-                        instance = element["elmt_type"]["initial"]()
-                    children.append(instance.getElementInfos(element_name))
+                    if isinstance(instance, (list, tuple)):
+                            # элемент описан с maxOccurs > 1 — обходим все экземпляры
+                            for element_instance in instance:
+                                children.append(element_instance.getElementInfos(element_name))
+                    else:
+                        if instance is None:
+                            instance = element["elmt_type"]["initial"]()
+                        children.append(instance.getElementInfos(element_name))
+
         doc[0:0] = classinfos["doc"]
         ret =  {"name": name,
                 "type": attr_type,
