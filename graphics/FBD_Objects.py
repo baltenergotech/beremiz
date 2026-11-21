@@ -503,7 +503,7 @@ class FBD_Block(Graphic_Element):
 # -------------------------------------------------------------------------------
 
 
-class FBD_Variable(Graphic_Element):
+class FBD_Variable(Graphic_Element, DebugDataConsumer):
     """
     Class that implements the graphic representation of a variable
     """
@@ -511,6 +511,7 @@ class FBD_Variable(Graphic_Element):
     # Create a new variable
     def __init__(self, parent, type, name, value_type, id=None, executionOrder=0):
         Graphic_Element.__init__(self, parent)
+        DebugDataConsumer.__init__(self)
         self.Type = None
         self.ValueType = None
         self.Id = id

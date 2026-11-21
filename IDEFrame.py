@@ -695,7 +695,7 @@ class IDEFrame(wx.Frame):
 
         self.Controler = None
         self.Config = wx.ConfigBase.Get()
-        
+
         # Enable debug (variable trace/force) and other beremiz related features
         # False in PLCOpenEditor
         self.EnableDebug = enable_debug
@@ -1430,7 +1430,13 @@ class IDEFrame(wx.Frame):
         event.Skip()
 
     def OnAllowNotebookDnD(self, event):
-        event.Allow()
+        try:
+            # оригинальный код
+            event.Allow()
+        except Exception as e:
+            #logging.exception("Error in AuiNotebook event handler")
+            # или print(traceback.format_exc())
+            event.Skip()
 
     def RefreshTabCtrlEvent(self):
         auitabctrl = []

@@ -80,10 +80,18 @@ def GetOptions(constant=True, retain=True, non_retain=True):
 
 def GetFilterChoiceTransfer():
     _ = NoTranslate
-    return {_("All"): _("All"), _("Interface"): _("Interface"),
-            _("   Input"): _("Input"), _("   Output"): _("Output"), _("   InOut"): _("InOut"),
-            _("   External"): _("External"), _("Variables"): _("Variables"), _("   Local"): _("Local"),
-            _("   Temp"): _("Temp"), _("Global"): _("Global")}  # , _("Access") : _("Access")}
+    return {
+        _("All"): _("All"),
+        _("Interface"): _("Interface"),
+        _("   Input"): _("Input"),
+        _("   Output"): _("Output"),
+        _("   InOut"): _("InOut"),
+        _("   External"): _("External"),
+        _("Variables"): _("Variables"),
+        _("   Local"): _("Local"),
+        _("   Temp"): _("Temp"),
+        _("Global"): _("Global")}
+# , _("Access") : _("Access")}
 
 
 CheckOptionForClass = {
@@ -114,10 +122,8 @@ class VariableTable(CustomTable):
         # The base class must be initialized *first*
         CustomTable.__init__(self, parent, data, colnames)
         self.old_value = None
-        self.OPTIONS_DICT = dict([(_(option), option)
-                                  for option in GetOptions()])
-        self.VARIABLE_CLASSES_DICT = dict([(_(_class), _class)
-                                           for _class in GetFilterChoiceTransfer().values()])
+        self.OPTIONS_DICT = dict([(_(option), option) for option in GetOptions()])
+        self.VARIABLE_CLASSES_DICT = dict([(_(_class), _class) for _class in GetFilterChoiceTransfer().values()])
 
     def GetValueByName(self, row, colname):
         if row < self.GetNumberRows():
@@ -222,9 +228,14 @@ class VariableTable(CustomTable):
                                 grid.SetReadOnly(row, col, True)
                             else:
                                 excluded = []
+                                # FIXME
                                 if self.Parent.IsFunctionBlockType(var_type):
-                                    excluded.extend(["Local", "Temp"])
-                                editor = wx.grid.GridCellChoiceEditor([_(choice) for choice in self.Parent.ClassList if choice not in excluded])
+                                    #excluded.extend(["Local", "Temp"])
+                                    choices= [_("Local")]
+                                    grid.SetReadOnly(row, col, True)
+                                else:
+                                    choices=[_(choice) for choice in self.Parent.ClassList if choice not in excluded]
+                                editor = wx.grid.GridCellChoiceEditor(choices)
                     elif colname != "Documentation":
                         grid.SetReadOnly(row, col, True)
 
@@ -697,7 +708,11 @@ class VariablePanel(wx.Panel):
            self.ElementType != "function" and self.BodyType in ["ST", "IL"]:
             return False
         else:
-            return self.Controler.GetBlockType(name, debug=self.Debug) is not None
+            blocktype = self.Controler.GetBlockType(name, debug=self.Debug)
+            if blocktype is None:
+                return False
+            if blocktype["type"] == "functionBlock":
+                return True
 
     def RefreshView(self):
         self.PouNames = self.Controler.GetProjectPouNames(self.Debug)

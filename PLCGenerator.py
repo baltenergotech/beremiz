@@ -459,11 +459,11 @@ class ProgramGenerator(object):
 
     # Generate the entire program for current project
     def GenerateProgram(self, log, noconfig=False):
-        log("Collecting data types")
+        log(_("Collecting data types"))
         # Find all data types defined
         for datatype in self.Project.getdataTypes():
             self.DatatypeComputed[datatype.getname()] = False
-        log("Collecting POUs")
+        log(_("Collecting POUs"))
         # Find all data types defined
         for pou in self.Project.getpous():
             self.PouComputed[pou.getname()] = False
@@ -473,24 +473,23 @@ class ProgramGenerator(object):
             self.Program += [("TYPE\n", ())]
             # Generate every data types defined
             for datatype_name in list(self.DatatypeComputed.keys()):
-                log("Generate Data Type %s"%datatype_name)
+                log(_("Generate Data Type '%s'") % datatype_name)
                 self.GenerateDataType(datatype_name)
             self.Program += [("END_TYPE\n\n", ())]
         # Generate every POUs defined
         for pou_name in list(self.PouComputed.keys()):
-            log("Generate POU %s"%pou_name)
+            log(_("Generate POU '%s'") % pou_name)
             self.GeneratePouProgram(pou_name)
         if noconfig:
             return
         # Generate every configurations defined
-        log("Generate Config(s)")
+        log(_("Generate Config(s)"))
         for config in self.Project.getconfigurations():
             self.Program += self.GenerateConfiguration(config)
 
     # Return generated program
     def GetGeneratedProgram(self):
         return self.Program
-
 
 # -------------------------------------------------------------------------------
 #                           Generator of POU programs

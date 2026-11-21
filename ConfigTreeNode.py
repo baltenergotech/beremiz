@@ -364,7 +364,8 @@ class ConfigTreeNode(object):
             # stack the result
             LocationCFilesAndCFLAGS += _LocationCFilesAndCFLAGS
             LDFLAGS += _LDFLAGS
-            extra_files += _extra_files
+            if len(_extra_files)>0:
+                extra_files += _extra_files
 
         return LocationCFilesAndCFLAGS, LDFLAGS, extra_files
 
