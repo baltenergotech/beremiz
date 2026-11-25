@@ -16,6 +16,9 @@
 #ifdef REALTIME_LINUX
 #include <sys/mman.h>
 #endif
+#ifdef BEREMIZ_TEST_CYCLES
+#include <unistd.h>
+#endif
 
 #define _Log(level,text,...) \
     {\
@@ -188,14 +191,22 @@ void PLC_thread_proc(void *arg)
         __CURRENT_TIME.tv_nsec = next_cycle_time.tv_nsec;
         // exit loop when enough cycles
         if(__tick >= BEREMIZ_TEST_CYCLES) {
-            _LogWarning("TEST PLC thread ended after "xstr(BEREMIZ_TEST_CYCLES)" cycles.\n");
-            // After pre-defined test cycles count, PLC thread exits.
-            // Remaining PLC runtime is expected to be cleaned-up/killed by test script
-            clock_nanosleep(CLOCK_MONOTONIC, 0, 1000*1000*1000 , NULL);
-            return;
+            if(__tick == BEREMIZ_TEST_CYCLES) {
+                // PLC naturally reached max cycle count
+                _LogWarning("TEST PLC thread ended after "xstr(BEREMIZ_TEST_CYCLES)" cycles.\n");
+            } else {
+                // cycle count was forced by test to abort execution
+                _LogWarning("TEST aborted PLC thread.\n");
+            }
+
+            // Close files eventually opened at initialization
+            PLC_cleanup();
+            // Give time for CLI to consume log
+            sleep(1);
+            exit(0);
         }
 #endif
-        __run(periods_passed);
+        PLC_run(periods_passed);
 
 #ifndef BEREMIZ_TEST_CYCLES
         // ensure next PLC cycle occurence is in the future
@@ -296,7 +307,7 @@ int startPLC(int argc,char **argv)
     pthread_mutex_lock(&debug_wait_mutex);
     pthread_mutex_lock(&python_wait_mutex);
 
-    if((ret = __init(argc,argv)) == 0 ){
+    if((ret = PLC_init(argc,argv)) == 0 ){
 
         /* Signal to wakeup PLC thread when period changes */
         signal(SIGUSR1, PLCThreadSignalHandler);
@@ -342,7 +353,7 @@ int stopPLC()
     /* Order PLCThread to exit */
     pthread_kill(PLC_thread, SIGUSR2);
     pthread_join(PLC_thread, NULL);
-    __cleanup();
+    PLC_cleanup();
 
     pthread_mutex_unlock(&debug_wait_mutex);
     pthread_mutex_unlock(&python_wait_mutex);
@@ -360,6 +371,14 @@ int WaitDebugData(unsigned int *tick)
     if (PLC_shutdown) return 1;
     /* Wait signal from PLC thread */
     res = pthread_mutex_lock(&debug_wait_mutex);
+
+    pthread_mutex_lock(&debug_mutex);
+    /*__DEBUG is protected by this mutex */
+    int tmp__DEBUG = __DEBUG;
+    pthread_mutex_unlock(&debug_mutex);
+    /* in case debug was disabled while waiting */
+    if(!tmp__DEBUG) return ENODATA;
+
     *tick = __debug_tick;
     return res;
 }
@@ -380,8 +399,13 @@ int suspendDebug(int disable)
     pthread_mutex_lock(&debug_mutex);
     /*__DEBUG is protected by this mutex */
     __DEBUG = !disable;
-    if (disable)
+    if (disable){
+        /* once debug disabled, PLC does no-op 
+           and no call to resumeDebug is expected */
         pthread_mutex_unlock(&debug_mutex);
+        /* unblocks trace thread waiting for data */
+        pthread_mutex_unlock(&debug_wait_mutex);
+    }
     return 0;
 }
 

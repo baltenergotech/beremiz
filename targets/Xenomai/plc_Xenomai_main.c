@@ -143,7 +143,7 @@ void PLC_task_proc(void *arg)
         if(overruns == 0){
             struct timespec plc_start_time, plc_end_time;
             clock_gettime(CLOCK_MONOTONIC, &plc_start_time);
-            __run(periods_passed);
+            PLC_run(periods_passed);
             clock_gettime(CLOCK_MONOTONIC, &plc_end_time);
             record_run_time_ns_avg(&plc_start_time, &plc_end_time);
             periods_passed = 1;
@@ -284,7 +284,7 @@ int stopPLC()
     rt_task_join(&PLC_task);
 
     PLC_cleanup_all();
-    __cleanup();
+    PLC_cleanup();
     __debug_tick = -1;
     return 0;
 }
@@ -342,7 +342,7 @@ int startPLC(int argc,char **argv)
         _startPLCLog("Failed creating PLC task");
     PLC_state |= PLC_STATE_TASK_CREATED;
 
-    if(__init(argc,argv)) goto error;
+    if(PLC_init(argc,argv)) goto error;
 
     /* start PLC task */
     if(rt_task_start(&PLC_task, &PLC_task_proc, NULL))
@@ -393,6 +393,8 @@ int WaitDebugData(unsigned int *tick)
     /* Wait signal from PLC thread */
     res = recv_RT_to_nRT_signal(WaitDebug_handle, &cmd);
     if (res == 1 && cmd == DEBUG_PENDING_DATA){
+        /* in case debug was disabled while waiting */
+        if(!__DEBUG) return ENODATA;
         *tick = __debug_tick;
         return 0;
     }
@@ -424,8 +426,12 @@ int suspendDebug(int disable)
        }
     }
     __DEBUG = !disable;
-    if (disable)
+    if (disable){
         AtomicCompareExchange( &debug_state, DEBUG_BUSY, DEBUG_FREE);
+        /* unblocks trace thread waiting for data */
+        char msg = DEBUG_PENDING_DATA;
+        send_RT_to_nRT_signal(WaitDebug_handle, msg);
+    }
     return 0;
 }
 

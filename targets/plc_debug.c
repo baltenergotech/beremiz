@@ -13,23 +13,41 @@
 #ifdef TARGET_DEBUG_AND_RETAIN_DISABLE
 
 int __init_debug    (void){return 0;}
+int __init_retain   (void){return 0;}
 void __cleanup_debug (void){}
 void __retrieve_debug(void){}
 void __publish_debug (void){}
 
 #else
 
-#include "iec_types_all.h"
-#include "POUS.h"
 /*for memcpy*/
 #include <string.h>
 #include <stdio.h>
 #include <errno.h>
 
+#include "beremiz.h"
+
+#include "accessor.h"
+#include "iec_std_lib.h"
+#include "POUS.h"
+
+#include "undef_macros.h"
+#include "pous_flatcount_c.h"
+#include "POUS.h"
+
+#include "undef_macros.h"
+#include "pous_recurse_c.h"
+#include "POUS.h"
+
 typedef unsigned int uint32_t;
 
 #define BUFFER_EMPTY 0
 #define BUFFER_FULL 1
+
+typedef struct {
+    void *ptr;
+    __IEC_types_enum type;
+} resolved_var_t;
 
 #ifndef TARGET_ONLINE_DEBUG_DISABLE
 
@@ -40,7 +58,7 @@ typedef unsigned int uint32_t;
 static uint32_t trace_buffer_state = BUFFER_EMPTY;
 
 typedef struct trace_item_s {
-    uint32_t dbgvardsc_index;
+    resolved_var_t var;
 } trace_item_t;
 
 trace_item_t trace_list[TRACE_LIST_SIZE];
@@ -60,7 +78,7 @@ static const char *trace_buffer_end = trace_buffer + TRACE_BUFFER_SIZE;
 #define FORCE_LIST_SIZE 256
 
 typedef struct force_item_s {
-    uint32_t dbgvardsc_index;
+    resolved_var_t var;
     void *value_pointer_backup;
 } force_item_t;
 
@@ -78,45 +96,180 @@ static const char *force_buffer_end = force_buffer + FORCE_BUFFER_SIZE;
 
 #endif
 
+/* Retain list — built once at init, iterated at every publish */
+#define RETAIN_LIST_SIZE 4096
+
+typedef struct {
+    void *value_ptr;
+    size_t size;
+} retain_item_t;
+
+static retain_item_t retain_list[RETAIN_LIST_SIZE];
+static unsigned int retain_list_count = 0;
+static unsigned int retain_total_size = 0;
+
 /***
  * Declare global variables from resources and conf 
  **/
 %(extern_variables_declarations)s
 
-typedef const struct {
-    void *ptr;
-    __IEC_types_enum type;
-} dbgvardsc_t;
-
-static const dbgvardsc_t dbgvardsc[] = {
-%(variable_decl_array)s
-};
-
-static const uint32_t retain_list[] = {
-%(retain_vardsc_index_array)s
-};
-static unsigned int retain_list_collect_cursor = 0;
-static const unsigned int retain_list_size = sizeof(retain_list)/sizeof(uint32_t);
-
-typedef void(*__for_each_variable_do_fp)(dbgvardsc_t*);
-void __for_each_variable_do(__for_each_variable_do_fp fp)
-{
-    unsigned int i;
-    for(i = 0; i < sizeof(dbgvardsc)/sizeof(dbgvardsc_t); i++){
-        dbgvardsc_t *dsc = &dbgvardsc[i];
-        if(dsc->type != UNKNOWN_ENUM) 
-            (*fp)(dsc);
-    }
-}
-
-#define __Unpack_desc_type dbgvardsc_t
+#define __Unpack_desc_type resolved_var_t
 
 %(var_access_code)s
+
+/***
+ * Retain list collection callbacks
+ **/
+typedef struct {
+    retain_item_t *cursor;
+    retain_item_t *end;
+    unsigned int total_size;
+    /* When > cumulated, the current leaf falls inside a complex
+     * variable (array/struct) that was itself flagged retain, so
+     * its leaves must be collected unconditionally. */
+    unsigned int retain_until_cum;
+} __retain_collect_ctx_t;
+
+/* Check retain flag on each leaf, add if retained */
+static int __retain_check_flags_cb(
+    __IEC_types_enum type, void *ptr,
+    unsigned int cumulated, unsigned int local,
+    unsigned int count, const char *name, void *userdata)
+{
+    __retain_collect_ctx_t *ctx = (__retain_collect_ctx_t *)userdata;
+    if (count > 1) {
+        /* If a complex variable (array/struct) is itself flagged
+         * retain, mark its whole flat range so all sub-leaves are
+         * collected without re-checking flags. flags is the first
+         * byte of any __IEC_*_t wrapper, so it can be read through
+         * ptr without knowing the exact wrapper typedef. */
+        if (type == ARRAY_ENUM || type == STRUCT_ENUM) {
+            if (*((IEC_BYTE *)ptr) & __IEC_RETAIN_FLAG) {
+                unsigned int end = cumulated + count;
+                if (end > ctx->retain_until_cum)
+                    ctx->retain_until_cum = end;
+            }
+        }
+        return 1;  /* recurse into sub-FBs/complex */
+    }
+    void *value_p = NULL;
+    char flags = 0;
+    size_t size = 0;
+    resolved_var_t dsc = {ptr, type};
+    UnpackVar(&dsc, &value_p, &flags, &size);
+    if ((flags & __IEC_RETAIN_FLAG) ||
+        ctx->retain_until_cum > cumulated) {
+        if (ctx->cursor < ctx->end) {
+            ctx->cursor->value_ptr = value_p;
+            ctx->cursor->size = size;
+            ctx->cursor++;
+        }
+        ctx->total_size += size;
+    }
+    return 1;
+}
+
+/***
+ * Resolve a flat variable index to pointer and type
+ * using __recurse accessors from POUS_accessors.h
+ **/
+typedef struct {
+    unsigned int target_local;
+    void *found_ptr;
+    __IEC_types_enum found_type;
+} __resolve_ctx_t;
+
+static int __resolve_cb(
+    __IEC_types_enum type, void *ptr,
+    unsigned int cumulated, unsigned int local,
+    unsigned int count, const char *name, void *userdata)
+{
+    __resolve_ctx_t *ctx = (__resolve_ctx_t *)userdata;
+    if (count > 1) {
+        if (ctx->target_local >= cumulated &&
+            ctx->target_local < cumulated + count)
+            return 1;   /* target is within subtree, recurse */
+        /* target is not in this subtree — skip it.
+         * Return -1 to hit the else { *cumulated += count; } branch
+         * in both struct and array __recurse functions.
+         * (Must not return count+1: array __recurse interprets
+         *  ret > 1 as "skip ret-1 array elements", not flat count.) */
+        return -1;
+    }
+    /* leaf */
+    if (cumulated == ctx->target_local) {
+        ctx->found_ptr = ptr;
+        ctx->found_type = type;
+        return 0;       /* stop */
+    }
+    return 1;           /* continue */
+}
+
+%(resolve_function)s
+
+%(build_retain_list)s
+
+/***
+ * Instance tree scan — call a Python callback for every node
+ * using __recurse accessors from POUS_accessors.h
+ **/
+typedef int (*__scan_callback_t)(
+    __IEC_types_enum type, void *ptr,
+    unsigned int cumulated, unsigned int local,
+    unsigned int count, const char *name, void *userdata);
+
+typedef struct {
+    __scan_callback_t callback;
+    void *userdata;
+} __scan_ctx_t;
+
+static int __scan_cb(
+    __IEC_types_enum type, void *ptr,
+    unsigned int cumulated, unsigned int local,
+    unsigned int count, const char *name, void *userdata)
+{
+    __scan_ctx_t *ctx = (__scan_ctx_t *)userdata;
+    return ctx->callback(type, ptr, cumulated, local, count,
+                         name ? name : "", ctx->userdata);
+}
+
+%(scan_instances)s
 
 void Remind(unsigned int offset, unsigned int count, void * p);
 
 extern int CheckRetainBuffer(void);
 extern int InitRetain(size_t);
+
+/*
+ * Retain setup, split out of __init_debug so that it can be called on its own.
+ * __build_retain_list() collects variables by reading the __IEC_RETAIN_FLAG that
+ * config_init__() sets, so it can only run once the instance tree is
+ * initialized.  The hot-swap path calls it on its own for that reason, see
+ * __init_PLCLogicSwapped in plc_logic_main.c.
+ **/
+int __init_retain(void)
+{
+    __build_retain_list();
+
+    int res = InitRetain(retain_total_size);
+    if (res != 0) {
+        char mstr[] = "RETAIN memory cannot be allocated";
+        LogMessage(LOG_WARNING, mstr, sizeof(mstr));
+        return res;
+    }
+    if (CheckRetainBuffer()) {
+        unsigned int offset = 0;
+        unsigned int i;
+        for (i = 0; i < retain_list_count; i++) {
+            Remind(offset, retain_list[i].size, retain_list[i].value_ptr);
+            offset += retain_list[i].size;
+        }
+    } else {
+        char mstr[] = "RETAIN memory invalid - defaults used";
+        LogMessage(LOG_WARNING, mstr, sizeof(mstr));
+    }
+    return 0;
+}
 
 int __init_debug(void)
 {
@@ -132,50 +285,7 @@ int __init_debug(void)
     force_list_apply_cursor = force_list;
 #endif
 
-    int buffer_ready = 0;
-    while(1){
-        unsigned int retain_offset = 0;
-        retain_list_collect_cursor = 0;
-        while(retain_list_collect_cursor < retain_list_size){
-            void *value_p = NULL;
-            size_t size;
-
-            dbgvardsc_t *dsc = &dbgvardsc[
-                retain_list[retain_list_collect_cursor]];
-
-            UnpackVar(dsc, &value_p, NULL, &size);
-
-            /* if buffer not full */
-            if(buffer_ready)
-                Remind(retain_offset, size, value_p);
-                
-            /* increment cursor according size*/
-            retain_offset += size;
-            retain_list_collect_cursor++;
-        }
-        if(!buffer_ready){
-            int res = InitRetain(retain_offset);
-            buffer_ready = (res == 0);
-            if (buffer_ready) {
-                if(CheckRetainBuffer())
-                    continue;
-                else {
-                    char mstr[] = "RETAIN memory invalid - defaults used";
-                    LogMessage(LOG_WARNING, mstr, sizeof(mstr));
-                    return 0;
-                }
-            } else {
-                char mstr[] = "RETAIN memory cannot be allocated";
-                LogMessage(LOG_WARNING, mstr, sizeof(mstr));
-                return res;
-            }
-        }
-        else
-        {
-            return 0;
-        }
-    }
-	return 0;
+    return __init_retain();
 }
 
 extern void InitiateDebugTransfer(int tick);
@@ -186,7 +296,7 @@ void __cleanup_debug(void)
 #ifndef TARGET_ONLINE_DEBUG_DISABLE
     trace_buffer_cursor = trace_buffer;
     InitiateDebugTransfer(__tick);
-#endif    
+#endif
 
     CleanupRetain();
 }
@@ -200,24 +310,7 @@ void Retain(unsigned int offset, unsigned int count, void * p);
 /* Return size of all retain variables */
 unsigned int GetRetainSize(void)
 {
-    unsigned int retain_size = 0;
-    retain_list_collect_cursor = 0;
-
-    /* iterate over retain list */
-    while(retain_list_collect_cursor < retain_list_size){
-        void *value_p = NULL;
-        size_t size;
-
-        dbgvardsc_t *dsc = &dbgvardsc[
-            retain_list[retain_list_collect_cursor]];
-
-        UnpackVar(dsc, &value_p, NULL, &size);
-
-        retain_size += size;
-        retain_list_collect_cursor++;
-    }
-
-    return retain_size;
+    return retain_total_size;
 }
 
 
@@ -226,6 +319,8 @@ extern uint32_t AtomicCompareExchange(uint32_t*, uint32_t, uint32_t);
 extern void LeaveDebugSection(void);
 extern void ValidateRetainBuffer(void);
 extern void InValidateRetainBuffer(void);
+
+#ifndef TARGET_ONLINE_DEBUG_DISABLE
 
 #define __ReForceOutput_case_p(TYPENAME)                                                            \
         case TYPENAME##_P_ENUM :                                                                    \
@@ -245,11 +340,14 @@ extern void InValidateRetainBuffer(void);
                 }                                                                                   \
             }                                                                                       \
             break;
+
+#endif
+
 void __publish_debug(void)
 {
     InValidateRetainBuffer();
-    
-#ifndef TARGET_ONLINE_DEBUG_DISABLE 
+
+#ifndef TARGET_ONLINE_DEBUG_DISABLE
     /* Check there is no running debugger re-configuration */
     if(TryEnterDebugSection()){
         /* Lock buffer */
@@ -257,7 +355,7 @@ void __publish_debug(void)
             &trace_buffer_state,
             BUFFER_EMPTY,
             BUFFER_FULL);
-            
+
         /* If buffer was free */
         if(latest_state == BUFFER_EMPTY)
         {
@@ -270,11 +368,10 @@ void __publish_debug(void)
 
             /* iterate over force list */
             while(!stop && force_list_apply_cursor < force_list_addvar_cursor){
-                dbgvardsc_t *dsc = &dbgvardsc[
-                    force_list_apply_cursor->dbgvardsc_index];
-                __IEC_types_enum vartype = dsc->type;
+                __IEC_types_enum vartype = force_list_apply_cursor->var.type;
                 switch(vartype){
                     __ANY(__ReForceOutput_case_p)
+                    __ReForceOutput_case_p(ENUM)
                 default:
                     break;
                 }
@@ -292,8 +389,7 @@ void __publish_debug(void)
                 size_t size = 0;
                 char* next_cursor;
 
-                dbgvardsc_t *dsc = &dbgvardsc[
-                    trace_list_collect_cursor->dbgvardsc_index];
+                resolved_var_t *dsc = &trace_list_collect_cursor->var;
 
                 UnpackVar(dsc, &value_p, NULL, &size);
 
@@ -317,9 +413,9 @@ void __publish_debug(void)
                 trace_buffer_cursor = next_cursor;
                 trace_list_collect_cursor++;
             }
-            
+
             /* Leave debug section,
-             * Trigger asynchronous transmission 
+             * Trigger asynchronous transmission
              * (returns immediately) */
             if (trace_list_collect_cursor != trace_list)
             {
@@ -329,26 +425,14 @@ void __publish_debug(void)
         LeaveDebugSection();
     }
 #endif
-    unsigned int retain_offset = 0;
-    /* when not debugging, do only retain */
-    retain_list_collect_cursor = 0;
-
-    /* iterate over retain list */
-    while(retain_list_collect_cursor < retain_list_size){
-        void *value_p = NULL;
-        size_t size = 0;
-
-        dbgvardsc_t *dsc = &dbgvardsc[
-            retain_list[retain_list_collect_cursor]];
-
-        UnpackVar(dsc, &value_p, NULL, &size);
-
-        /* if buffer not full */
-        Retain(retain_offset, size, value_p);
-        /* increment cursor according size*/
-        retain_offset += size;
-
-        retain_list_collect_cursor++;
+    /* Save retain variables */
+    {
+        unsigned int offset = 0;
+        unsigned int i;
+        for (i = 0; i < retain_list_count; i++) {
+            Retain(offset, retain_list[i].size, retain_list[i].value_ptr);
+            offset += retain_list[i].size;
+        }
     }
     ValidateRetainBuffer();
 }
@@ -366,94 +450,124 @@ void __publish_debug(void)
         goto error_cleanup;                                                             \
     }
 
-#define __ForceVariable_case_t(TYPENAME)                                                \
-        case TYPENAME##_ENUM :                                                          \
-            __ForceVariable_checksize(TYPENAME)                                         \
-            /* add to force_list*/                                                      \
-            force_list_addvar_cursor->dbgvardsc_index = idx;                            \
+/*
+ * Force setup macros — no size check, caller guarantees type match.
+ * Used by ForceVariable(); RegisterDebugVariable() validates size first.
+ **/
+#define __Force_case_t(TYPENAME)                                                        \
+        case TYPENAME##_ENUM: {                                                         \
+            force_list_addvar_cursor->var = resolved;                                   \
             ((__IEC_##TYPENAME##_t *)varp)->flags |= __IEC_FORCE_FLAG;                  \
-            ((__IEC_##TYPENAME##_t *)varp)->value = *((TYPENAME *)force);               \
-            break;
-#define __ForceVariable_case_p(TYPENAME)                                                \
-        case TYPENAME##_P_ENUM :                                                        \
-        case TYPENAME##_O_ENUM :                                                        \
-            __ForceVariable_checksize(TYPENAME)                                         \
-            {                                                                           \
-                char *next_cursor = force_buffer_cursor + sizeof(TYPENAME);             \
-                if(next_cursor <= force_buffer_end ){                                   \
-                    /* add to force_list*/                                              \
-                    force_list_addvar_cursor->dbgvardsc_index = idx;                    \
-                    /* outputs real value must be systematically forced */              \
-                    if(vartype == TYPENAME##_O_ENUM)                                    \
-                        *(((__IEC_##TYPENAME##_p *)varp)->value) = *((TYPENAME *)force);\
-                    /* save pointer to backup */                                        \
-                    force_list_addvar_cursor->value_pointer_backup =                    \
-                        ((__IEC_##TYPENAME##_p *)varp)->value;                          \
-                    /* store forced value in force_buffer */                            \
-                    *((TYPENAME *)force_buffer_cursor) = *((TYPENAME *)force);          \
-                    /* replace pointer with pointer to force_buffer */                  \
-                    ((__IEC_##TYPENAME##_p *)varp)->value =                             \
-                        (TYPENAME *)force_buffer_cursor;                                \
-                    /* mark variable as forced */                                       \
-                    ((__IEC_##TYPENAME##_p *)varp)->flags |= __IEC_FORCE_FLAG;          \
-                    /* inc force_buffer cursor */                                       \
-                    force_buffer_cursor = next_cursor;                                  \
-                } else {                                                                \
-                    error_code = FORCE_BUFFER_OVERFLOW;                                 \
-                    goto error_cleanup;                                                 \
-                }                                                                       \
-            }                                                                           \
-            break;
+            ((__IEC_##TYPENAME##_t *)varp)->value = *((TYPENAME *)force_value);         \
+            break; }
 
+#define __Force_case_p(TYPENAME)                                                        \
+        case TYPENAME##_P_ENUM:                                                         \
+        case TYPENAME##_O_ENUM: {                                                       \
+            char *next_cursor = force_buffer_cursor + sizeof(TYPENAME);                 \
+            if(next_cursor > force_buffer_end)                                          \
+                return FORCE_BUFFER_OVERFLOW;                                           \
+            force_list_addvar_cursor->var = resolved;                                   \
+            /* outputs real value must be systematically forced */                      \
+            if(vartype == TYPENAME##_O_ENUM)                                            \
+                *(((__IEC_##TYPENAME##_p *)varp)->value) = *((TYPENAME *)force_value);  \
+            /* save pointer to backup */                                                \
+            force_list_addvar_cursor->value_pointer_backup =                            \
+                ((__IEC_##TYPENAME##_p *)varp)->value;                                  \
+            /* store forced value in force_buffer */                                    \
+            *((TYPENAME *)force_buffer_cursor) = *((TYPENAME *)force_value);            \
+            /* replace pointer with pointer to force_buffer */                          \
+            ((__IEC_##TYPENAME##_p *)varp)->value = (TYPENAME *)force_buffer_cursor;    \
+            /* mark variable as forced */                                               \
+            ((__IEC_##TYPENAME##_p *)varp)->flags |= __IEC_FORCE_FLAG;                  \
+            /* inc force_buffer cursor */                                               \
+            force_buffer_cursor = next_cursor;                                          \
+            break; }
+
+/*
+ * ForceVariable — set up force_list entry and apply force to a variable.
+ *
+ * Called by RegisterDebugVariable (after size check) and by execute_copy_ops
+ * (via plc_force_var_fn function pointer) to reconstruct forces across a hot-swap.
+ * force_value must point to a value of the correct size for type.
+ **/
+int ForceVariable(void *ptr, __IEC_types_enum type, void *force_value)
+{
+    if(force_list_addvar_cursor > force_list_end)
+        return FORCE_LIST_OVERFLOW;
+
+    void *varp = ptr;
+    __IEC_types_enum vartype = type;
+    resolved_var_t resolved = {ptr, type};
+
+    /* GCC false-positive: __IEC_STRING_t.flags is at offset 127;
+     * GCC sees small objects and warns. STRING_ENUM only resolves to __IEC_STRING_t. */
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wstringop-overflow"
+    switch(type){
+        __ANY(__Force_case_t)
+        __ANY(__Force_case_p)
+        __Force_case_t(ENUM)
+        __Force_case_p(ENUM)
+        default: return 0;
+    }
+#pragma GCC diagnostic pop
+    force_list_addvar_cursor++;
+    return 0;
+}
+
+/* Size-check-only case macros for RegisterDebugVariable.
+ * Validate Python-provided force_size before delegating to ForceVariable. */
+#define __ForceVariable_checksize_t(TYPENAME)                                           \
+        case TYPENAME##_ENUM:                                                           \
+            __ForceVariable_checksize(TYPENAME) break;
+
+#define __ForceVariable_checksize_p(TYPENAME)                                           \
+        case TYPENAME##_P_ENUM:                                                         \
+        case TYPENAME##_O_ENUM:                                                         \
+            __ForceVariable_checksize(TYPENAME) break;
 
 void ResetDebugVariables(void);
 
 int RegisterDebugVariable(uint32_t idx, void* force, size_t force_size)
 {
     int error_code = 0;
-    if(idx < sizeof(dbgvardsc)/sizeof(dbgvardsc_t)){
-        /* add to trace_list, inc trace_list_addvar_cursor*/
+    resolved_var_t resolved;
+    if(resolve_instance(idx, &resolved) == 0){
+        /* add to trace_list */
         if(trace_list_addvar_cursor <= trace_list_end){
-            trace_list_addvar_cursor->dbgvardsc_index = idx;
+            trace_list_addvar_cursor->var = resolved;
             trace_list_addvar_cursor++;
         } else {
             error_code = TRACE_LIST_OVERFLOW;
             goto error_cleanup;
         }
         if(force){
-            if(force_list_addvar_cursor <= force_list_end){
-                dbgvardsc_t *dsc = &dbgvardsc[idx];
-                void *varp = dsc->ptr;
-                __IEC_types_enum vartype = dsc->type;
-
-                switch(vartype){
-                    __ANY(__ForceVariable_case_t)
-                    __ANY(__ForceVariable_case_p)
-                default:
-                    break;
-                }
-                /* inc force_list cursor */
-                force_list_addvar_cursor++;
-            } else {
-                error_code = FORCE_LIST_OVERFLOW;
-                goto error_cleanup;
+            /* Validate size of Python-provided force data before applying */
+            __IEC_types_enum vartype = resolved.type;
+            switch(vartype){
+                __ANY(__ForceVariable_checksize_t)
+                __ANY(__ForceVariable_checksize_p)
+                __ForceVariable_checksize_t(ENUM)
+                __ForceVariable_checksize_p(ENUM)
+                default: break;
             }
+            error_code = ForceVariable(resolved.ptr, resolved.type, force);
+            if(error_code)
+                goto error_cleanup;
         }
     }
     return 0;
 
 error_cleanup:
     ResetDebugVariables();
-    trace_buffer_state = BUFFER_EMPTY;
     return error_code;
-    
+
 }
 
 #define ResetForcedVariable_case_t(TYPENAME)                                            \
         case TYPENAME##_ENUM :                                                          \
             ((__IEC_##TYPENAME##_t *)varp)->flags &= ~__IEC_FORCE_FLAG;                 \
-            /* for local variable we don't restore original value */                    \
-            /* that can be added if needed, but it was like that since ever */          \
             break;
 
 #define ResetForcedVariable_case_p(TYPENAME)                                            \
@@ -473,23 +587,25 @@ void ResetDebugVariables(void)
     force_list_apply_cursor = force_list;
     /* Restore forced variables */
     while(force_list_apply_cursor < force_list_addvar_cursor){
-        dbgvardsc_t *dsc = &dbgvardsc[
-            force_list_apply_cursor->dbgvardsc_index];
-        void *varp = dsc->ptr;
-        switch(dsc->type){
+        void *varp = force_list_apply_cursor->var.ptr;
+        switch(force_list_apply_cursor->var.type){
             __ANY(ResetForcedVariable_case_t)
             __ANY(ResetForcedVariable_case_p)
+            ResetForcedVariable_case_t(ENUM)
+            ResetForcedVariable_case_p(ENUM)
         default:
             break;
         }
         /* inc force_list cursor */
         force_list_apply_cursor++;
-    } /* else TODO: warn user about failure to force */ 
+    }
 
     /* Reset force list */
     force_list_addvar_cursor = force_list;
     /* Reset force buffer */
     force_buffer_cursor = force_buffer;
+
+    trace_buffer_state = BUFFER_EMPTY;
 }
 
 void FreeDebugData(void)
@@ -512,4 +628,3 @@ int GetDebugData(unsigned int *tick, unsigned int *size, void **buffer){
 }
 #endif
 #endif
-

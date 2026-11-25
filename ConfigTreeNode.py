@@ -155,9 +155,6 @@ class ConfigTreeNode(object):
 
         return False
 
-    def RemoteExec(self, script, **kwargs):
-        return self.CTNParent.RemoteExec(script, **kwargs)
-
     def OnCTNSave(self, from_project_path=None):
         """Default, do nothing and return success"""
         return True
@@ -600,8 +597,8 @@ class ConfigTreeNode(object):
         """
         # reorganize self.CTNChildrenTypes tuples from (name, CTNClass, Help)
         # to ( name, (CTNClass, Help)), an make a dict
-        transpose = list(zip(*self.CTNChildrenTypes))
-        CTNChildrenTypes = dict(list(zip(transpose[0], list(zip(transpose[1], transpose[2])))))
+        CTNChildrenTypes = {name: (CTNClass, CTNHelp)
+                            for name, CTNClass, CTNHelp in self.CTNChildrenTypes}
         # Check that adding this confnode is allowed
         try:
             CTNClass, CTNHelp = CTNChildrenTypes[CTNType]
@@ -693,9 +690,12 @@ class ConfigTreeNode(object):
             child.ClearChildren()
         self.Children = {}
 
+<<<<<<< HEAD
     LoadErrorImpliesUserCheck = \
         _("Note: loading errors are expected when opening projects written for different targets. Check config.\n")
 
+=======
+>>>>>>> origin/HEAD
     def LoadXMLParams(self, CTNName=None):
         methode_name = os.path.join(self.CTNPath(CTNName), "methods.py")
         if os.path.isfile(methode_name):
@@ -712,7 +712,6 @@ class ConfigTreeNode(object):
                     (fname, lnum, src) = ((ConfNodeName + " BaseParams",) + error)
                     logger = self.GetCTRoot().logger
                     logger.write_warning(XSDSchemaErrorMessage.format(a1=fname, a2=lnum, a3=src))
-                    logger.write_warning(self.LoadErrorImpliesUserCheck)
                 self.MandatoryParams = ("BaseParams", self.BaseParams)
                 basexmlfile.close()
             except Exception as exc:
@@ -729,7 +728,8 @@ class ConfigTreeNode(object):
                     (fname, lnum, src) = ((ConfNodeName,) + error)
                     logger = self.GetCTRoot().logger
                     logger.write_warning(XSDSchemaErrorMessage.format(a1=fname, a2=lnum, a3=src))
-                    logger.write_warning(self.LoadErrorImpliesUserCheck)
+                    if(fname == "Project" and "TargetType" in src):
+                        logger.write(_("Note: Examples intentionally do not define target type in order to work as-is on all platforms.\nWarning about missing TargetType is then perfectly fine, please ignore it.\nTarget matching your platform have been implicitly selected.\n"))
                 name = obj.getLocalTag()
                 setattr(self, name, obj)
                 self.CTNParams = (name, obj)

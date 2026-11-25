@@ -15,8 +15,12 @@
  * */
 
 #include "iec_types_all.h"
+#include "accessor.h"
 #include "POUS.h"
 #include <string.h>
+#ifdef BEREMIZ_TEST_CYCLES
+#include <time.h>
+#endif
 
 /* The fifo (fixed size, as number of FB is fixed) */
 static PYTHON_EVAL_data__* EvalFBs[%(python_eval_fb_count)d];
@@ -30,6 +34,9 @@ static int PythonState;
 #define PYTHON_LOCKED_BY_PLC 1
 #define PYTHON_MUSTWAKEUP 2
 #define PYTHON_FINISHED 4
+
+/* Hold back new requests, set by PLCObject around a logic hot-swap. */
+static int PythonPurge;
 
 /* Each python_eval FunctionBlock have it own state */
 #define PYTHON_FB_FREE 0
@@ -50,6 +57,7 @@ int __init_py_ext()
 	Current_Python_EvalFB = 0;
 	Current_PLC_EvalFB = 0;
 	PythonState = PYTHON_LOCKED_BY_PYTHON;
+	PythonPurge = 0;
 	for(i = 0; i < %(python_eval_fb_count)d; i++)
 		EvalFBs[i] = NULL;
   return 0;
@@ -63,13 +71,30 @@ void __cleanup_py_ext()
 
 void __retrieve_py_ext()
 {
+	/* Defensive: an enqueue outside a retrieve/publish window would otherwise
+	 * lose its wakeup here, PythonState being rewritten wholesale below. */
+	int mustwakeup = PythonState & PYTHON_MUSTWAKEUP;
+#ifdef BEREMIZ_TEST_CYCLES
+	/* Emulated time: wait for python thread to answer all requests, as if
+	 * it took no time, so that answers come at the next cycle, always */
+	LockPython();
+	while(EvalFBs[Current_Python_EvalFB] && !(PythonState & PYTHON_FINISHED)){
+		struct timespec delay = {0, 100000};
+		UnLockPython();
+		nanosleep(&delay, NULL);
+		LockPython();
+	}
+	PythonState = PYTHON_LOCKED_BY_PLC;
+#else
 	/* Check Python thread is not being
 	 * modifying internal python_eval data */
 	PythonState = TryLockPython() ?
 	                PYTHON_LOCKED_BY_PLC :
 	                PYTHON_LOCKED_BY_PYTHON;
+#endif
 	/* If python thread _is_ in, then PythonState remains PYTHON_LOCKED_BY_PYTHON
 	 * and python_eval will no do anything */
+	PythonState |= mustwakeup;
 }
 
 void __publish_py_ext()
@@ -78,6 +103,7 @@ void __publish_py_ext()
 		/* If runnig PLC did push something in the fifo*/
 		if(PythonState & PYTHON_MUSTWAKEUP){
 			/* WakeUp python thread */
+			PythonState &= ~PYTHON_MUSTWAKEUP;
 			UnBlockPythonCommands();
 		}
 		UnLockPython();
@@ -107,8 +133,27 @@ void __PythonEvalFB(int poll, PYTHON_EVAL_data__* data__)
 	/* retain value for next rising edge detection */
 	__SET_VAR(data__->, TRIGM1,, __GET_VAR(data__->TRIG));
 
-	/* python thread is not in ? */
-	if( PythonState & PYTHON_LOCKED_BY_PLC){
+	 /* enqueue if not purging and if python is already in */
+	if(!PythonPurge && PythonState & PYTHON_LOCKED_BY_PLC) {
+		/* Refresh the fifo entry of a request in flight.  A logic hot-swap
+		 * copies SLOT over to the instance replacing this one and invalidates
+		 * the entries it leaves behind, so claiming the entry here is what
+		 * makes the answer land in the instance the PLC actually runs.  A
+		 * cleared entry means the python thread gave up on it before we got
+		 * here: ask again rather than wait for an answer that will not come. */
+		if(__GET_VAR(data__->STATE) == PYTHON_FB_REQUESTED ||
+		   __GET_VAR(data__->STATE) == PYTHON_FB_PROCESSING){
+			int slot = (int)__GET_VAR(data__->SLOT);
+			if(slot < 0){
+				/* invalidated by a hot-swap, ~slot holds the entry index */
+				slot = ~slot;
+				__SET_VAR(data__->, SLOT,, slot);
+			}
+			if(EvalFBs[slot] == NULL)
+				__SET_VAR(data__->, STATE,, PYTHON_FB_FREE);
+			else if(EvalFBs[slot] != data__)
+				EvalFBs[slot] = data__;
+		}
 		/* if some answer are waiting, publish*/
 		if(__GET_VAR(data__->STATE) == PYTHON_FB_ANSWERED){
 			/* Copy buffer content into result*/
@@ -134,7 +179,9 @@ void __PythonEvalFB(int poll, PYTHON_EVAL_data__* data__)
 			 * Don't have to check if fifo cell is free
 			 * as fifo size == FB count, and a FB cannot
 			 * be requested twice */
-			EvalFBs[Current_PLC_EvalFB] = data__;
+			/* remember where, so that an instance swapped in later can claim
+			 * this entry back (see above) */
+			__SET_VAR(data__->, SLOT,, Current_PLC_EvalFB);
 			/* copy into BUFFER local*/
 			__SET_VAR(data__->, BUFFER,, __GET_VAR(data__->PREBUFFER));
 			/* Set ACK pin to low so that we can set a rising edge on result */
@@ -147,6 +194,10 @@ void __PythonEvalFB(int poll, PYTHON_EVAL_data__* data__)
 			}
 			/* Mark FB busy */
 			__SET_VAR(data__->, STATE,, PYTHON_FB_REQUESTED);
+			/* Only now publish the entry: the python thread drops entries that
+			 * do not claim their index, so it must never see a half filled one
+			 * (py_ext's own instances run outside the python mutex) */
+			EvalFBs[Current_PLC_EvalFB] = data__;
 			/* Have to wakeup python thread in case he was asleep */
 			PythonState |= PYTHON_MUSTWAKEUP;
 			/*printf("__PythonEvalFB push %%d - %%*s\n",Current_PLC_EvalFB, data__->BUFFER.len, data__->BUFFER.body);*/
@@ -168,6 +219,7 @@ char* PythonIterator(char* result, void** id, int* is_last)
 	/* Get current FB */
 	data__ = EvalFBs[Current_Python_EvalFB];
 	if(data__ && /* may be null at first run */
+	    __GET_VAR(data__->SLOT) == Current_Python_EvalFB && /* still its entry */
 	    __GET_VAR(data__->STATE) == PYTHON_FB_PROCESSING){ /* some answer awaited*/
 	   	/* If result not None */
 	   	if(result){
@@ -192,11 +244,24 @@ char* PythonIterator(char* result, void** id, int* is_last)
 		Current_Python_EvalFB = (Current_Python_EvalFB + 1) %% %(python_eval_fb_count)d;
 		//printf("PythonIterator ++ Current_Python_EvalFB %%d\n", Current_Python_EvalFB);
 	}
-	/* while next slot is empty */
-	while(((data__ = EvalFBs[Current_Python_EvalFB]) == NULL) ||
-	 	  /* or doesn't contain command */
-	      __GET_VAR(data__->STATE) != PYTHON_FB_REQUESTED)
+	/* look for the next command to eval */
+	while(1)
 	{
+		data__ = EvalFBs[Current_Python_EvalFB];
+		if(data__ &&
+		   /* an entry the FB no longer claims was left behind by a hot-swap,
+		    * or has already been dealt with: drop it and move on, or we would
+		    * wait on it forever */
+		   (__GET_VAR(data__->SLOT) != Current_Python_EvalFB ||
+		    __GET_VAR(data__->STATE) != PYTHON_FB_REQUESTED))
+		{
+			EvalFBs[Current_Python_EvalFB] = NULL;
+			Current_Python_EvalFB = (Current_Python_EvalFB + 1) %% %(python_eval_fb_count)d;
+			continue;
+		}
+		/* slot holds a command */
+		if(data__) break;
+		/* slot is empty */
 		UnLockPython();
 		/* wait next FB to eval */
 		//printf("PythonIterator wait\n");
@@ -221,3 +286,22 @@ char* PythonIterator(char* result, void** id, int* is_last)
 	return next_command;
 }
 
+void PythonSetPurge(int value){
+	PythonPurge = value;
+}
+
+/* Logic lifecycle hook (see plc_ios_main_head.c): the logic .so became active.
+ * Called by the PLC thread right after instance state was copied over, so the
+ * fifo may still refer to instances of the .so being replaced.  Invalidate
+ * every entry: whichever instance the PLC actually runs claims its own back on
+ * its next execution (~i keeps the index so it knows which), and what no
+ * execution refreshes gets dropped by PythonIterator instead of stalling it.
+ * Then re-enable Python eval FB processing, purged around a hot-swap by
+ * PLCObject.py. */
+void __logic_active_py_ext(void){
+	int i;
+	for(i = 0; i < %(python_eval_fb_count)d; i++)
+		if(EvalFBs[i])
+			__SET_VAR(EvalFBs[i]->, SLOT,, ~i);
+	PythonSetPurge(0);
+}

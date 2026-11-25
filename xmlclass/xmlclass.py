@@ -1812,6 +1812,9 @@ class XMLElementClassLookUp(etree.PythonElementClassLookup):
         :return:
             Returns element class corresponding to given element.
         """
+        if not isinstance(element.tag, str):
+            # comments and processing instructions keep lxml default class
+            return None
         element_class = self.GetLookupResult(element)
         if element_class is not None:
             return element_class
@@ -1822,7 +1825,10 @@ class XMLElementClassLookUp(etree.PythonElementClassLookup):
         if isinstance(element_class, list):
             children = "".join([
                 "%s " % etree.QName(child.tag).localname
-                for child in element])
+                # skip comments and processing instructions 
+                # when building the list of child tag names
+                for child in element
+                if isinstance(child.tag, str)])
             for possible_class in element_class:
                 if isinstance(possible_class, str):
                     possible_class = self.GetElementClass(possible_class)

@@ -2,11 +2,11 @@
 # Dockerfile for Beremiz
 # This container is used to run tests for Beremiz
 #
-FROM ubuntu:noble
+FROM ubuntu:resolute
                                         
 ENV TERM xterm-256color
 
-ENV TZ America/Paris
+ENV TZ UTC
 ENV DEBIAN_FRONTEND noninteractive
 
 ENV LANG en_US.UTF-8
@@ -24,62 +24,26 @@ RUN set -xe \
 
 RUN set -xe \
     && apt-get install -y --no-install-recommends \
-               `# to run sikuli` \
                wget \
-               openjdk-11-jre \
-               tesseract-ocr \
                \
-               `# to run X based tests` \
-               fluxbox \
-               wmctrl xdotool xvfb \
-               x11vnc xterm xnest \
-               materia-gtk-theme \
+               `# to run GTK Broadway based tests` \
+               libgtk-3-bin \
                \
                `# to build tested apps` \
                build-essential automake flex bison mercurial \
                libgtk-3-dev libgl1-mesa-dev libglu1-mesa-dev \
                libpython3-dev libssl-dev \
                python3-wxgtk4.0 \
-               python3-venv virtualenv cmake ninja-build git
+               python3-venv virtualenv cmake ninja-build git \
+               \
+               `# to test Linux PLC-SDK : arm64 cross libc, and libgcc from cross gcc` \
+               clang lld qemu-user libc6-dev-arm64-cross gcc-aarch64-linux-gnu
 
-# force bigger font and flat theme for GTK in order to make OCR more reliable
-RUN mkdir -p /etc/gtk-3.0
-RUN env echo -e '[Settings]\ngtk-font-name=FreeSans,12\ngtk-theme-name=Materia\n' > /etc/gtk-3.0/settings.ini
+### Playwright dependencies : libasound2t64 (seems needed by embedded chromium) ###
+RUN apt-get install -qqy --no-install-recommends libasound2t64 python3-gi
 
-                                # link obtained from https://raiman.github.io/SikuliX1/downloads.html
-#RUN set -xe && \
-#    wget -qP /usr/local/bin \
-#        https://launchpad.net/sikuli/sikulix/2.0.5/+download/sikulixide-2.0.5.jar && \
-#    echo 0795f1e0866ee5a7a84e4c89793ea78c /usr/local/bin/sikulixide-2.0.5.jar | md5sum -c && \
-#    ( echo '#!/bin/sh' && \
-#      echo "exec java -jar /usr/local/bin/sikulixide-*.jar \"\$@\"" \
-#    ) | install /dev/stdin /usr/local/bin/sikulix
-
-RUN set -xe && \
-    wget -qP /usr/local/bin \
-        https://github.com/beremiz/SikuliX1/releases/download/2.0.6-20230417/sikulixidelux-2.0.6-20230417.154102-17.jar && \
-    echo 205551891355da0a54db9924db9b2b36 /usr/local/bin/sikulixidelux-2.0.6-20230417.154102-17.jar | md5sum -c && \
-    ( echo '#!/bin/sh' && \
-      echo "exec java -jar /usr/local/bin/sikulixidelux-2.0.6-20230417.154102-17.jar \"\$@\"" \
-    ) | install /dev/stdin /usr/local/bin/sikulix
-
-
-
-### SVGHMI dependencies : Chromium browser + Inkscape ###
-#
-# On ubuntu chromium is distrinuted as a snap.
-# Running snapd on docker is a mess.
-# As a workaround, there is a PPA where chromium .deb packges build is still beeing maintained :
-#
-# https://launchpad.net/~savoury1/+archive/ubuntu/chromium
-#     ppa:savoury1, maintained by Rob Savoury at the time of writing
-#
-# As a side effect of docker limitations, chromium need --no-sandbox command line argument.
-#
-RUN apt-get install -qqy --no-install-recommends gnupg software-properties-common \
-    && add-apt-repository -y ppa:savoury1/chromium \
-    && add-apt-repository -y ppa:savoury1/ffmpeg4 \
-    && apt-get install -qqy --no-install-recommends chromium-browser inkscape
+### SVGHMI dependencies : Inkscape ###
+RUN apt-get install -qqy --no-install-recommends inkscape
 
 # easy to remember 'do_tests' alias to invoke main makefile
 RUN echo '#!/bin/bash\nmake -f /home/'$UNAME'/src/beremiz/tests/Makefile $*' > /usr/local/bin/do_tests
@@ -93,23 +57,22 @@ RUN python3 -m venv --system-site-packages ~/beremizenv
 
 # beremiz python requirements
 # file is placed here by build_docker_image.sh
-COPY requirements.txt /home/$UNAME
-RUN ~/beremizenv/bin/pip install --upgrade --no-deps -r /home/$UNAME/requirements.txt
+COPY requirements_pinned.txt /home/$UNAME
+RUN ~/beremizenv/bin/pip install --upgrade --no-deps -r /home/$UNAME/requirements_pinned.txt
 
 # tests specific python requirements : pytest pytest-timeout ddt crossbar
 
 ## How to upgrade requirements and test requirements together:
-# pip install -r beremiz/requirements_latest.txt
-# pip freeze > beremiz/requirements.txt
-# pip install pytest pytest-timeout ddt crossbar
-# pip freeze > requirements_all.txt
-# sort requirements_all.txt -o requirements_all_sorted.txt 
-# sort beremiz/requirements.txt -o requirements_sorted.txt
-# comm -13 requirements_sorted.txt requirements_all_sorted.txt > beremiz/tests/tools/Docker/test_requirements.txt
-# rm requirements_all.txt requirements_sorted.txt requirements_all_sorted.txt
+# pip install --no-deps -r ../../../requirements_pinned.txt 
+# pip freeze > requirements_pinned_freezed.txt 
+# pip install -r requirements_tests.txt 
+# pip freeze > requirements_test_freezed.txt 
+# sort requirements_pinned_freezed.txt -o requirements_pinned_freezed_sorted.txt 
+# sort requirements_test_freezed.txt -o requirements_test_freezed_sorted.txt
+# comm -13 requirements_pinned_freezed_sorted.txt requirements_test_freezed_sorted.txt > requirements_tests_pinned.txt
 
-COPY test_requirements.txt /home/$UNAME
-RUN ~/beremizenv/bin/pip install -r /home/$UNAME/test_requirements.txt --no-deps
+COPY requirements_tests_pinned.txt /home/$UNAME
+RUN ~/beremizenv/bin/pip install -r /home/$UNAME/requirements_tests_pinned.txt --no-deps
      
 # Why --no-deps : 
 #    - Mandatory because crossbar's dependencies are expressed with github url,
@@ -120,17 +83,19 @@ RUN ~/beremizenv/bin/pip install -r /home/$UNAME/test_requirements.txt --no-deps
 #    - because of broken crossbar requirements, 'pip install -r' fails meeting
 #      requirement expressed on a branch or tag with a commit hash based install
 
+# Headless Chromium for Playwright, to display and drive IDE on GTK Broadway backend
+RUN ~/beremizenv/bin/playwright install chromium --only-shell
 
-# Additional Tesseract data files to allow OCR in legacy mode ("oem(0)" in sikuli)
+
+# MQTT Eclipse Paho Testing Utilities
 RUN set -xe && \
-    cd  /home/$UNAME && mkdir tessdata && \
-    wget -q https://github.com/tesseract-ocr/tessdata/archive/refs/tags/4.1.0.tar.gz \
-         -O tessdata.tar.gz && \
-    echo 89e25c7c40a59be7195422a01f57fcb2 tessdata.tar.gz | md5sum -c && \
-    tar --strip-components=1 -C tessdata -x -v -z -f tessdata.tar.gz && \
-    rm tessdata.tar.gz
+    cd  /home/$UNAME && mkdir paho.mqtt.testing && \
+    wget -q https://github.com/eclipse-paho/paho.mqtt.testing/archive/9d7bb80bb8b9d9cfc0b52f8cb4c1916401281103.tar.gz \
+         -O paho.mqtt.testing.tar.gz && \
+    echo 816c4410bfc8ea0901970690763531a0 paho.mqtt.testing.tar.gz | md5sum -c && \
+    tar --strip-components=1 -C paho.mqtt.testing -x -v -z -f paho.mqtt.testing.tar.gz && \
+    rm paho.mqtt.testing.tar.gz
 
-ENV TESSDATAPATH /home/$UNAME/tessdata
 
 # Points to python binary that test will use
 ENV BEREMIZPYTHONPATH /home/$UNAME/beremizenv/bin/python

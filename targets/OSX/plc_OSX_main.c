@@ -113,7 +113,7 @@ void PLC_thread_proc(void *arg)
         struct timespec plc_start_time, plc_end_time;
         dispatch_semaphore_wait(Run_PLC, DISPATCH_TIME_FOREVER);
         clock_gettime(CLOCK_MONOTONIC, &plc_start_time);
-        __run(1);
+        PLC_run(1);
         clock_gettime(CLOCK_MONOTONIC, &plc_end_time);
 		record_run_time_ns_avg(&plc_start_time, &plc_end_time);
     }
@@ -146,7 +146,7 @@ int startPLC(int argc, char **argv)
     dispatch_source_set_event_handler_f(PLC_timer, PLC_timer_notify);
     dispatch_source_set_cancel_handler_f(PLC_timer, PLC_timer_cancel);
 
-    if (__init(argc, argv) == 0) {
+    if (PLC_init(argc, argv) == 0) {
         PLC_SetTimer(common_ticktime__, common_ticktime__);
 
         /* install signal handler for manual break */
@@ -186,7 +186,7 @@ int stopPLC()
     dispatch_release(Run_PLC);
     Run_PLC = NULL;
     dispatch_source_cancel(PLC_timer);
-    __cleanup();
+    PLC_cleanup();
     pthread_mutex_destroy(&debug_wait_mutex);
     pthread_mutex_destroy(&debug_mutex);
     pthread_mutex_destroy(&python_wait_mutex);
@@ -201,6 +201,14 @@ int WaitDebugData(unsigned int *tick)
         return 1;
     /* Wait signal from PLC thread */
     res = pthread_mutex_lock(&debug_wait_mutex);
+
+    pthread_mutex_lock(&debug_mutex);
+    /*__DEBUG is protected by this mutex */
+    int tmp__DEBUG = __DEBUG;
+    pthread_mutex_unlock(&debug_mutex);
+    /* in case debug was disabled while waiting */
+    if(!tmp__DEBUG) return ENODATA;
+
     *tick = __debug_tick;
     return res;
 }
@@ -221,8 +229,13 @@ int suspendDebug(int disable)
     pthread_mutex_lock(&debug_mutex);
     /*__DEBUG is protected by this mutex */
     __DEBUG = !disable;
-    if (disable)
+    if (disable){
+        /* once debug disabled, PLC does no-op
+           and no call to resumeDebug is expected */
         pthread_mutex_unlock(&debug_mutex);
+        /* unblocks trace thread waiting for data */
+        pthread_mutex_unlock(&debug_wait_mutex);
+    }
     return 0;
 }
 

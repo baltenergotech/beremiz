@@ -61,6 +61,15 @@ class POULibrary(object):
         return self.CTR()
 
     def GetTypes(self):
+        """
+        Types of the library, for the IDE and the libraries loaded after it.
+        Its POUs appear in the library panel under "<name> POUs". A library
+        may sort some of them into categories of their own by adding to the
+        returned dictionary:
+          "categories": [(category name, [POU name, ...]), ...]
+
+        @return: {"name": library name, "types": project of the library}
+        """
         return {"name": self.GetName(),
                 "types": self.LibraryControler.Project
                          if self.LibraryControler else None}
@@ -68,16 +77,72 @@ class POULibrary(object):
     def GetLibraryPath(self):
         raise Exception("Not implemented")
 
-    def Generate_C(self, buildpath, varlist, IECCFLAGS):
+    def GetSDKFiles(self):
+        """
+        Generated files a plc-sdk has to carry along this library's POUs, so
+        that a PLC rebuilt from the SDK still resolves the C symbols they call.
+        Only meaningful once Generate_C has run.
+
+        @return: ([(Cfile, CFLAGS), ...], [header, ...])
+        """
+        return [], []
+
+    def GetSDKObjectFiles(self):
+        """
+        C files from GetSDKFiles() a plc-sdk ships as the object this build
+        compiled them into, rather than as source. Only sound for a file that
+        doesn't depend on the project it was built with, and only worth it for
+        one too big for every PLC programmer to rebuild.
+
+        @return: [Cfile, ...], a subset of GetSDKFiles()'s C files
+        """
+        return []
+
+    def GetSDKPythonFiles(self):
+        """
+        Python module a plc-sdk has to carry along this library's POUs, so
+        that the confnodes feeding them still import when the IDE builds from
+        the SDK alone. Files are copied next to the SDK's features.py, which
+        is on sys.path, hence importable by their own name.
+
+        @return: [python_file, ...]
+        """
+        return []
+
+    def GetSDKDoCalls(self):
+        """
+        DoCalls a plc-sdk has to rebuild GetSDKFiles() with, when the library
+        exposes __init_/__cleanup_/__retrieve_/__publish_ and not just plain C
+        functions. See definitions in ConfigTreeNode.CTNGenerate_C.
+
+        @return: same as Generate_C's DoCalls
+        """
+        return False
+
+    def CheckProject(self, pous_data):
+        """
+        Checks this library makes on the project it is about to be built into.
+        Separate from Generate_C because a plc-sdk replaces that one, and a
+        library's constraints outlive the build that produced the SDK.
+        """
+        pass
+
+    def Generate_C(self, buildpath, pous_data, IECCFLAGS):
         """
         Generate C code for Libraries
         
         Generate_C returns a tuple :
           (["library_name"],[(Cfiles, CFLAGS)], DoCalls), LDFLAGS, *extra_files
 
+        The first element may also be a list of such location-entries, when a
+        library needs to place C files in more than one target binary (e.g. a
+        split hot-swap build where some files go to the IOs .so and others to
+        the logic .so, selected by location truthiness in toolchain_gcc):
+          [(["name"], [(Cfiles, CFLAGS)], DoCalls), ([], [...], DoCalls)], LDFLAGS, *extra_files
+
         extra_files is:
           [(fname,fobject), ...]
-          
+
         DoCalls is either a Boolean, a dictionary, or a string,
         see definitions in ConfigTreeNode.CTNGenerate_C
         """
@@ -101,6 +166,9 @@ class POULibrary(object):
             the user, but without backtrace since it is not a software error """
 
         raise UserAddressedException(message)
+
+    def OnModelRefresh(self):
+        pass
 
     def SupportsTarget(self, target):
         return True

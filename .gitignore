@@ -6,7 +6,7 @@
 **/.svghmithumbs/**
 **/my_*.der
 **/my_*.pem
-tests/tools/Docker/requirements.txt
+tests/tools/Docker/requirements_pinned.txt
 **/management.json
 **/.secret
 
@@ -17,3 +17,7 @@ C_runtime/**/*.d
 C_runtime/**/*.o
 beremiz_runtime
 **/tmp/**
+__builtins__.pyi
+
+# IEC 61131-3 Annex A grammar is IEC copyrighted: keep it and derived grammars local
+tc6_tree_convert/iec61131-3-3rd*.ebnf

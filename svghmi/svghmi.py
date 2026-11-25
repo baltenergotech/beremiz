@@ -21,7 +21,7 @@ from lxml.etree import XSLTApplyError
 
 import util.paths as paths
 from POULibrary import POULibrary
-from docutil import open_svg, get_inkscape_path
+from docutil import open_svg, get_inkscape_path, get_inkscape_env
 
 from util.ProcessLogger import ProcessLogger
 from runtime.typemapping import DebugTypesSize
@@ -37,6 +37,88 @@ from svghmi.fonts import GetFontTypeAndFamilyName, GetCSSFontFaceFromFontFile
 
 
 ScriptDirectory = paths.AbsDir(__file__)
+
+
+def _svghmi_cpath(path_list):
+    """Compute SVGHMI C path from IEC path list.
+    CONFIG__VAR, RESOURCE__VAR, RESOURCE__PROG.VAR, RESOURCE__PROG.FB.VAR, ...
+    """
+    parts = [p.upper() for p in path_list]
+    if len(parts) <= 2:
+        return "__".join(parts)
+    if len(parts) == 3:
+        return "__".join(parts[1:])
+    return "__".join(parts[1:3]) + "." + ".".join(parts[3:])
+
+
+def _collect_hmi_instances(ctr):
+    """Traverse PLCopen model, return [(path, derived, iectype, vartype), ...] for all HMI_* vars."""
+    project = ctr.GetProject(debug=False)
+    if project is None:
+        return []
+
+    _varclass_to_vartype = {
+        "Local": "VAR", "Global": "VAR", "Temp": "VAR",
+        "External": "EXT", "Input": "IN", "Output": "OUT", "InOut": "MEM",
+    }
+
+    def _var_typename(var):
+        content = var.type.getcontent()
+        tag = content.getLocalTag()
+        return content.getname() if tag == "derived" else tag.upper()
+
+    result = []
+
+    def _collect_pou_vars(type_name, path_prefix):
+        pou = project.getpou(type_name)
+        if pou is None:
+            return
+        for var_class, varlist in pou.getvars():
+            vartype = _varclass_to_vartype.get(var_class, "VAR")
+            for var in varlist.getvariable():
+                typename = _var_typename(var)
+                var_path = path_prefix + [var.getname().upper()]
+                if typename in HMI_TYPES:
+                    result.append((var_path, typename,
+                                   ctr.GetBaseType(typename) or typename, vartype))
+                elif var_class in ("functionBlock", "program"):
+                    _collect_pou_vars(typename, var_path)
+
+    configs = project.getconfigurations()
+    if configs:
+        # Library/CTN-provided config globals (e.g. HMI_ROOT, heartbeat) are not in
+        # the PLCopen project model — they come from GetConfNodeGlobalInstances() as tuples.
+        cfg_name = configs[0].getname().upper()
+        for item in ctr.GetConfNodeGlobalInstances():
+            if isinstance(item, tuple) and len(item) >= 2:
+                name, iec_type = item[0], item[1]
+                if iec_type in HMI_TYPES:
+                    result.append(([cfg_name, name.upper()], iec_type,
+                                   ctr.GetBaseType(iec_type) or iec_type, "VAR"))
+        for config in configs:
+            config_name = config.getname().upper()
+            for varlist in config.getglobalVars():
+                for var in varlist.getvariable():
+                    typename = _var_typename(var)
+                    if typename in HMI_TYPES:
+                        result.append(([config_name, var.getname().upper()], typename,
+                                    ctr.GetBaseType(typename) or typename, "VAR"))
+            for resource in config.getresource():
+                res_name = resource.getname().upper()
+                for varlist in resource.getglobalVars():
+                    for var in varlist.getvariable():
+                        typename = _var_typename(var)
+                        if typename in HMI_TYPES:
+                            result.append(([config_name, res_name, var.getname().upper()], typename,
+                                        ctr.GetBaseType(typename) or typename, "VAR"))
+                instances = list(resource.getpouInstance())
+                for task in resource.gettask():
+                    instances.extend(task.getpouInstance())
+                for inst in instances:
+                    _collect_pou_vars(inst.gettypeName(),
+                                    [config_name, res_name, inst.getname().upper()])
+
+    return result
 
 
 # module scope for HMITree root
@@ -57,8 +139,7 @@ class SVGHMILibrary(POULibrary):
     def GetLibraryPath(self):
          return paths.AbsNeighbourFile(__file__, "pous.xml")
 
-    def Generate_C(self, buildpath, varlist, IECCFLAGS):
-
+    def Generate_C(self, buildpath, pous_data, IECCFLAGS):
         self.maxConnectionsTotal = 0
 
         already_found_watchdog = False
@@ -66,10 +147,7 @@ class SVGHMILibrary(POULibrary):
         for CTNChild in self.GetCTR().IterChildren():
             if isinstance(CTNChild, SVGHMI):
                 found_SVGHMI_instance = True
-                # collect maximum connection total for all svghmi nodes
                 self.maxConnectionsTotal += CTNChild.GetParamsAttributes("SVGHMI.MaxConnections")["value"]
-
-                # spot watchdog abuse
                 if CTNChild.GetParamsAttributes("SVGHMI.EnableWatchdog")["value"]:
                     if already_found_watchdog:
                         self.FatalError("SVGHMI: Only one watchdog enabled HMI allowed")
@@ -78,171 +156,93 @@ class SVGHMILibrary(POULibrary):
         if not found_SVGHMI_instance:
             self.FatalError("SVGHMI : Library is selected but not used. Please either deselect it in project config or add a SVGHMI node to project.")
 
-
-        """
-        PLC Instance Tree:
-          prog0
-           +->v1 HMI_INT
-           +->v2 HMI_INT
-           +->fb0 (type mhoo)
-           |   +->va HMI_NODE
-           |   +->v3 HMI_INT
-           |   +->v4 HMI_INT
-           |
-           +->fb1 (type mhoo)
-           |   +->va HMI_NODE
-           |   +->v3 HMI_INT
-           |   +->v4 HMI_INT
-           |
-           +->fb2
-               +->v5 HMI_IN
-
-        HMI tree:
-          hmi0
-           +->v1
-           +->v2
-           +->fb0 class:va
-           |   +-> v3
-           |   +-> v4
-           |
-           +->fb1 class:va
-           |   +-> v3
-           |   +-> v4
-           |
-           +->v5
-
-        """
-
-        # Filter known HMI types
-        hmi_types_instances = [v for v in varlist if v["derived"] in HMI_TYPES]
-
-        self.hmi_tree_root = None
-
-        # take first HMI_NODE (placed as special node), make it root
-        for i,v in enumerate(hmi_types_instances):
-            path = v["IEC_path"].split(".")
-            derived = v["derived"]
-            if derived == "HMI_NODE":
-                self.hmi_tree_root = HMITreeNode(path, "", derived, v["type"], v["vartype"], v["C_path"])
-                hmi_types_instances.pop(i)
-                break
-
-        # deduce HMI tree from PLC HMI_* instances
-        for v in hmi_types_instances:
-            path = v["IEC_path"].split(".")
-            # ignores variables starting with _TMP_
-            if path[-1].startswith("_TMP_"):
-                continue
-            vartype = v["vartype"]
-            # ignores external variables
-            if vartype == "EXT":
-                continue
-            derived = v["derived"]
-            kwargs={}
-            if derived == "HMI_NODE":
-                # TODO : make problem if HMI_NODE used in CONFIG or RESOURCE
-                name = path[-2]
-                kwargs['hmiclass'] = path[-1]
-            else:
-                name = path[-1]
-            new_node = HMITreeNode(path, name, derived, v["type"], vartype, v["C_path"], **kwargs)
-            placement_result = self.hmi_tree_root.place_node(new_node)
-            if placement_result is not None:
-                cause, problematic_node = placement_result
-                if cause == "Non_Unique":
-                    message = _("HMI tree nodes paths are not unique.\nConflicting variable: {} {}").format(
-                        ".".join(problematic_node.path),
-                        ".".join(new_node.path))
-
-                    last_FB = None 
-                    for _v in varlist:
-                        if _v["vartype"] == "FB":
-                            last_FB = _v 
-                        if _v["C_path"] == problematic_node:
-                            break
-                    if last_FB is not None:
-                        failing_parent = last_FB["type"]
-                        message += "\n"
-                        message += _("Solution: Add HMI_NODE at beginning of {}").format(failing_parent)
-
-                elif cause in ["Late_HMI_NODE", "Duplicate_HMI_NODE"]:
-                    cause, problematic_node = placement_result
-                    message = _("There must be only one occurrence of HMI_NODE before any HMI_* variable in POU.\nConflicting variable: {} {}").format(
-                        ".".join(problematic_node.path),
-                        ".".join(new_node.path))
-
-                self.FatalError("SVGHMI : " + message)
-
+        instances = _collect_hmi_instances(self.GetCTR())
+        self._build_hmi_tree(instances, cpath_fn=_svghmi_cpath)
         self.on_hmitree_update()
 
         variable_decl_array = []
-        extern_variables_declarations = []
+        # Item indices of the per-instance CURRENT_PAGE_<loc> HMI_STRING globals, so
+        # the runtime can restore each HMI's page position across a hot-swap.
+        current_page_indices = []
         buf_index = 0
         item_count = 0
-        found_heartbeat = False
+        heartbeat_index = None
 
-        hearbeat_IEC_path = ['CONFIG', 'HEARTBEAT']
+        hearbeat_IEC_path = [pous_data.configname.upper(), 'HEARTBEAT']
 
         for node in self.hmi_tree_root.traverse():
-            if not found_heartbeat and node.path == hearbeat_IEC_path:
-                hmi_tree_hearbeat_index = item_count
-                found_heartbeat = True
-                extern_variables_declarations += [
-                    "#define heartbeat_index "+str(hmi_tree_hearbeat_index)
-                ]
+            if heartbeat_index is None and node.path == hearbeat_IEC_path:
+                heartbeat_index = item_count
             if hasattr(node, "iectype"):
                 sz = DebugTypesSize.get(node.iectype, 0)
+                enum = node.iectype + {
+                    "EXT": "_P_ENUM",
+                    "IN":  "_P_ENUM",
+                    "MEM": "_O_ENUM",
+                    "OUT": "_O_ENUM",
+                    "VAR": "_ENUM"
+                }[node.vartype]
                 variable_decl_array += [
-                    "HMITREE_ITEM_INITIALIZER(" + node.cpath + ", " + node.iectype + {
-                        "EXT": "_P_ENUM",
-                        "IN":  "_P_ENUM",
-                        "MEM": "_O_ENUM",
-                        "OUT": "_O_ENUM",
-                        "VAR": "_ENUM"
-                    }[node.vartype] + ", " +
+                    "HMITREE_ITEM_INITIALIZER(" + node.cpath + ", " + enum + ", " +
                     str(buf_index) + ")"]
+                if node.path[-1].startswith("CURRENT_PAGE_"):
+                    current_page_indices.append(item_count)
                 buf_index += sz
                 item_count += 1
-                if len(node.path) == 1:
-                    extern_variables_declarations += [
-                        "extern __IEC_" + node.iectype + "_" +
-                        "t" if node.vartype == "VAR" else "p"
-                        + node.cpath + ";"]
 
-        assert(found_heartbeat)
+        assert(heartbeat_index is not None)
 
-        # TODO : filter only requiered external declarations
-        extern_variables_declarations += [
-                {
-                    "EXT": "extern __IEC_%(type)s_p %(C_path)s;",
-                    "IN":  "extern __IEC_%(type)s_p %(C_path)s;",
-                    "MEM": "extern __IEC_%(type)s_p %(C_path)s;",
-                    "OUT": "extern __IEC_%(type)s_p %(C_path)s;",
-                    "VAR": "extern __IEC_%(type)s_t %(C_path)s;",
-                    "FB":  "extern %(type)s_data__ %(C_path)s;"
-                }[v["vartype"]] % v
-                for v in varlist if v["C_path"].find('.') < 0]
+        extern_variables_declarations = [
+            "extern %s %s;" % (c_type, c_name)
+            for _path, _fc, _bt, _tc, c_name, c_type, _r, _nd, _ic in pous_data.instances_c
+        ]
 
-        # C code to observe/access HMI tree variables
-        svghmi_c_filepath = paths.AbsNeighbourFile(__file__, "svghmi.c")
-        svghmi_c_file = open(svghmi_c_filepath, 'r')
-        svghmi_c_code = svghmi_c_file.read()
-        svghmi_c_file.close()
-        svghmi_c_code = svghmi_c_code % {
-            "variable_decl_array": ",\n".join(variable_decl_array),
-            "extern_variables_declarations": "\n".join(extern_variables_declarations),
-            "buffer_size": buf_index,
-            "item_count": item_count,
+        # HMI-tree / settings dependent data (item array, buffers, geometry, tree hash)
+        # is instantiated on the logic side (svghmi_data.c) so that svghmi.c — compiled
+        # into the IOs .so — stays independent of HMI content, and its &(cpath) item
+        # initializers resolve against the PLC program instances defined in the logic .so.
+        # In single-binary (SDK / ABI) builds both files land in the same binary and
+        # resolve by direct linkage.
+        split = self.GetCTR().IsSplitBuild()
+
+        # Shared header (item struct + macro + MAX_CONNECTIONS), included by both C files.
+        gen_svghmi_h_code = open(
+            paths.AbsNeighbourFile(__file__, "svghmi.h"), 'r').read() % {
+            "max_connections": self.maxConnectionsTotal}
+        open(os.path.join(buildpath, "svghmi.h"), 'w').write(gen_svghmi_h_code)
+
+        # IOs-side observer / websocket server: ticktime + variable access code only.
+        svghmi_c_code = open(
+            paths.AbsNeighbourFile(__file__, "svghmi.c"), 'r').read() % {
+            "late_bind": "#define SVGHMI_LATE_BIND" if split else "",
             "var_access_code": targets.GetCode("var_access.c"),
             "PLC_ticktime": self.GetCTR().GetTicktime(),
-            "hmi_hash_ints": ",".join(map(str,self.hmi_tree_root.hash())),
-            "max_connections": self.maxConnectionsTotal
             }
-
         gen_svghmi_c_path = os.path.join(buildpath, "svghmi.c")
-        gen_svghmi_c = open(gen_svghmi_c_path, 'w')
-        gen_svghmi_c.write(svghmi_c_code)
-        gen_svghmi_c.close()
+        open(gen_svghmi_c_path, 'w').write(svghmi_c_code)
+
+        # Logic-side data: item array + buffers + geometry constants + tree fingerprint.
+        svghmi_data_code = open(
+            paths.AbsNeighbourFile(__file__, "svghmi_data.c"), 'r').read() % {
+            "extern_variables_declarations": "\n".join(extern_variables_declarations),
+            "variable_decl_array": ",\n".join(variable_decl_array),
+            "item_count": item_count,
+            "buffer_size": buf_index,
+            "max_connections": self.maxConnectionsTotal,
+            "heartbeat_index": heartbeat_index,
+            "hmi_hash_ints": ",".join(map(str, self.hmi_tree_root.hash())),
+            "current_page_count": len(current_page_indices),
+            "current_page_indices": ",".join(map(str, current_page_indices)) or "0",
+            }
+        gen_svghmi_data_c_path = os.path.join(buildpath, "svghmi_data.c")
+        open(gen_svghmi_data_c_path, 'w').write(svghmi_data_code)
+
+        # svghmi.c -> IOs .so (truthy location); svghmi_data.c -> logic .so (empty,
+        # falsy location routed there by toolchain_gcc's "for_ios = Location or ...").
+        c_entries = [
+            (["svghmi"], [(gen_svghmi_c_path, IECCFLAGS)], True),
+            ([], [(gen_svghmi_data_c_path, IECCFLAGS)], False),
+            ]
 
         # Python based WebSocket HMITree Server
         svghmiserverfile = open(paths.AbsNeighbourFile(__file__, "svghmi_server.py"), 'r')
@@ -254,17 +254,58 @@ class SVGHMILibrary(POULibrary):
         runtimefile.write(svghmiservercode)
         runtimefile.close()
 
-        # Backup HMI Tree in XML form so that it can be loaded without building
-        hmitree_backup_path = os.path.join(buildpath, "hmitree.xml")
-        hmitree_backup_file = open(hmitree_backup_path, 'wb')
-        hmitree_backup_file.write(etree.tostring(self.hmi_tree_root.etree()))
-        hmitree_backup_file.close()
-
-        return ((["svghmi"], [(gen_svghmi_c_path, IECCFLAGS)], True), "",
+        return (c_entries, "",
                 ("runtime_00_svghmi.py", open(runtimefile_path, "rb")))
                 #         ^
                 # note the double zero after "runtime_", 
                 # to ensure placement before other CTN generated code in execution order
+
+    def _build_hmi_tree(self, hmi_instances, cpath_fn=None):
+        self.hmi_tree_root = None
+        hmi_types_instances = [(p, d, i, v) for p, d, i, v in hmi_instances
+                               if d in HMI_TYPES]
+
+        for idx, (path, derived, iectype, vartype) in enumerate(hmi_types_instances):
+            if derived == "HMI_NODE":
+                cpath = cpath_fn(path) if cpath_fn else None
+                self.hmi_tree_root = HMITreeNode(path, "", derived, iectype, vartype, cpath)
+                hmi_types_instances.pop(idx)
+                break
+
+        if self.hmi_tree_root is None:
+            return
+
+        for path, derived, iectype, vartype in hmi_types_instances:
+            if path[-1].startswith("_TMP_"):
+                continue
+            if vartype == "EXT":
+                continue
+            kwargs = {}
+            if derived == "HMI_NODE":
+                name = path[-2]
+                kwargs["hmiclass"] = path[-1]
+            else:
+                name = path[-1]
+            cpath = cpath_fn(path) if cpath_fn else None
+            new_node = HMITreeNode(path, name, derived, iectype, vartype, cpath, **kwargs)
+            placement_result = self.hmi_tree_root.place_node(new_node)
+            if placement_result is not None:
+                cause, problematic_node = placement_result
+                if cause == "Non_Unique":
+                    message = _("HMI tree nodes paths are not unique.\nConflicting variable: {} {}").format(
+                        ".".join(problematic_node.path), ".".join(new_node.path))
+                elif cause in ["Late_HMI_NODE", "Duplicate_HMI_NODE"]:
+                    message = _("There must be only one occurrence of HMI_NODE before any HMI_* variable in POU.\nConflicting variable: {} {}").format(
+                        ".".join(problematic_node.path), ".".join(new_node.path))
+                self.FatalError("SVGHMI : " + message)
+
+    def OnModelRefresh(self):
+        try:
+            instances = _collect_hmi_instances(self.GetCTR())
+            self._build_hmi_tree(instances)
+        except Exception:
+            self.hmi_tree_root = None
+        self.on_hmitree_update()
 
     def GlobalInstances(self):
         """ Adds HMI tree root and hearbeat to PLC Configuration's globals """
@@ -296,18 +337,8 @@ class SVGHMIEditor(ConfTreeNodeEditor):
     def CreateSVGHMI_UI(self, parent):
         ctroot = self.Controler.GetCTRoot()
         svghmilib = ctroot.Libraries["SVGHMI"]
-
-        if svghmilib.hmi_tree_root is None:
-            buildpath = ctroot._getBuildPath()
-            hmitree_backup_path = os.path.join(buildpath, "hmitree.xml")
-            if os.path.exists(hmitree_backup_path):
-                hmitree_backup_file = open(hmitree_backup_path, 'rb')
-                svghmilib.hmi_tree_root = HMITreeNode.from_etree(etree.parse(hmitree_backup_file).getroot())
-
         ret = SVGHMI_UI(parent, self.Controler, svghmilib.Register_SVGHMI_UI_for_HMI_tree_updates)
-
         svghmilib.on_hmitree_update()
-
         return ret
 
 if sys.platform.startswith('win'):
@@ -455,7 +486,8 @@ class SVGHMI(object):
         status, result, _err_result = ProcessLogger(self.GetCTRoot().logger,
                                                      [inkpath, '-S', svgpath],
                                                      no_stdout=True,
-                                                     no_stderr=True).spin()
+                                                     no_stderr=True,
+                                                     env=get_inkscape_env()).spin()
         if status != 0:
             self.FatalError("SVGHMI: inkscape couldn't extract geometry from given SVG.")
 

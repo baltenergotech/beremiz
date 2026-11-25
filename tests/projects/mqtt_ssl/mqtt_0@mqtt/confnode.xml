@@ -1,5 +1,5 @@
 <?xml version='1.0' encoding='utf-8'?>
-<MQTTClient xmlns:xsd="http://www.w3.org/2001/XMLSchema" Broker_URI="wss://192.168.19.25:18885">
+<MQTTClient xmlns:xsd="http://www.w3.org/2001/XMLSchema" Broker_URI="wss://127.0.0.1:18885">
   <AuthType>
     <x509 Client_certificate="" Broker_certificate="test-root-ca.crt" Verify_hostname="false"/>
   </AuthType>

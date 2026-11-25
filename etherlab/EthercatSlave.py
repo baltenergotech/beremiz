@@ -61,6 +61,23 @@ def ExtractName(names, default=None):
                 return name.getcontent()
     return default
 
+PDO ="""<xsd:attribute name="RxPDO" type="xsd:string" use="optional" default=""/>
+<xsd:attribute name="TxPDO" type="xsd:string" use="optional" default=""/>
+"""
+
+# Whether the PDOs of the slave can be reassigned and remapped is normally read
+# from the CoE section of its ESI file. These let the user overrule an ESI file
+# that does not describe the device faithfully.
+PDO_CAPABILITIES = "\n".join(["""\
+<xsd:attribute name="%s" use="optional" default="Auto">
+  <xsd:simpleType>
+    <xsd:restriction base="xsd:string">
+      <xsd:enumeration value="Auto"/>
+      <xsd:enumeration value="Enabled"/>
+      <xsd:enumeration value="Disabled"/>
+    </xsd:restriction>
+  </xsd:simpleType>
+</xsd:attribute>""" % name for name in ["PdoAssign", "PdoConfig"]]) + "\n"
 
 # --------------------------------------------------
 #                    Ethercat Node
@@ -70,11 +87,33 @@ class _EthercatSlaveCTN(object):
     NODE_PROFILE = None
     EditorType = NodeEditor
 
+    XSD = """<?xml version="1.0" encoding="ISO-8859-1" ?>
+    <xsd:schema xmlns:xsd="http://www.w3.org/2001/XMLSchema">
+
+      <xsd:element name="EthercatSlaveParams">
+        <xsd:complexType>
+          <xsd:sequence/>
+          %s
+        </xsd:complexType>
+      </xsd:element>
+
+    </xsd:schema>
+    """ % (PDO + PDO_CAPABILITIES)
+
     def __init__(self):
         # ----------- call ethercat mng. function --------------
         self.CommonMethod = _CommonSlave(self)
         self.SelectedRxPDOIndex = []
         self.SelectedTxPDOIndex = []
+
+    def GetSlaveParams(self):
+        """
+        PDO and DC parameters of this slave, whatever the XSD root element is
+        called : plain slaves store them in EthercatSlaveParams, CiA402 slaves
+        in CIA402SlaveParams.
+        @return the confnode parameters object, None when there is none
+        """
+        return self.CTNParams[1] if self.CTNParams else None
 
     def GetIconName(self):
         return "Slave"
@@ -105,7 +144,8 @@ class _EthercatSlaveCTN(object):
                     'type': 'element',
                     'name': 'SlaveParams',
                     'value': None,
-                    'children': []
+                    'children': [],
+                    'doc': [{"documentation": "EtherCAT slave parameters"}]
                 })
 
             slave_type = self.CTNParent.GetSlaveType(self.GetSlavePos())
@@ -115,15 +155,8 @@ class _EthercatSlaveCTN(object):
                     'use': 'optional',
                     'type': self.CTNParent.GetSlaveTypesLibrary(self.NODE_PROFILE),
                     'name': 'Type',
-                    'value': (slave_type["device_type"], slave_type)
-                })
-            params[0]['children'].insert(
-                1,
-                {
-                    'use': 'optional',
-                    'type': 'unsignedLong',
-                    'name': 'Alias',
-                    'value': self.CTNParent.GetSlaveAlias(self.GetSlavePos())
+                    'value': (slave_type["device_type"], slave_type),
+                    'doc': [{"documentation": "EtherCAT slave type"}]
                 })
             return params
 
@@ -131,23 +164,21 @@ class _EthercatSlaveCTN(object):
         self.GetSlaveInfos()
         position = self.BaseParams.getIEC_Channel()
 
-        if path == "SlaveParams.Type":
+        # "Type" is shown among the confnode parameters but stored in the
+        # master network configuration, so it is handled here rather than by
+        # ConfigTreeNode. The parameters editor prefixes it with the XSD root
+        # element name, the master calls it by its bare name.
+        root = self.CTNParams[0] if self.CTNParams else "SlaveParams"
+
+        if path in ("SlaveParams.Type", "%s.Type" % root):
             self.CTNParent.SetSlaveType(position, value)
             slave_type = self.CTNParent.GetSlaveType(self.GetSlavePos())
-            value = (slave_type["device_type"], slave_type)
-            # if self._View is not None:
-            #     wx.CallAfter(self._View.EtherCATManagementTreebook.SlaveStatePanel.RefreshSlaveInfos())
-            #     self._View.EtherCATManagementTreebook.SlaveStatePanel.RefreshSlaveInfos()
-            #     self._View.EtherCATManagementTreebook.PDOMonitoringPanel.PDOInfoUpdate()
-            #     self._View.EtherCATManagementTreebook.SmartView.Create_SmartView()
-            return value, True
-        elif path == "SlaveParams.Alias":
-            self.CTNParent.SetSlaveAlias(position, value)
-            return value, True
+            return slave_type["device_type"], True
 
         value, refresh = ConfigTreeNode.SetParamsAttribute(self, path, value)
 
-        # Filter IEC_Channel, Slave_Type and Alias that have specific behavior
+        # IEC_Channel is the ring position of the slave, keep the network
+        # configuration in sync when it changes
         if path == "BaseParams.IEC_Channel" and value != position:
             self.CTNParent.SetSlavePosition(position, value)
 

@@ -35,42 +35,13 @@ from etherlab.EthercatSlave import \
     TYPECONVERSION, \
     VARCLASSCONVERSION, \
     _CommonSlave
+from etherlab.rpc import CallEtherCAT, EtherCATError
 
 try:
     from etherlab.EthercatCIA402Slave import _EthercatCIA402SlaveCTN
     HAS_MCL = True
-except Exception as e:
+except Exception:
     HAS_MCL = False
-
-# --------------------------------------------------
-#         Remote Exec Etherlab Commands
-# --------------------------------------------------
-
-SCAN_COMMAND = """
-import commands
-result = commands.getoutput("ethercat slaves")
-slaves = []
-for slave_line in result.splitlines():
-    chunks = slave_line.split()
-    idx, pos, state, flag = chunks[:4]
-    name = " ".join(chunks[4:])
-    alias, position = pos.split(":")
-    slave = {"idx": int(idx),
-             "alias": int(alias),
-             "position": int(position),
-             "name": name}
-    details = commands.getoutput("ethercat slaves -p %d -v" % slave["idx"])
-    for details_line in details.splitlines():
-        details_line = details_line.strip()
-        for header, param in [("Vendor Id:", "vendor_id"),
-                              ("Product code:", "product_code"),
-                              ("Revision number:", "revision_number")]:
-            if details_line.startswith(header):
-                slave[param] = details_line.split()[-1]
-                break
-    slaves.append(slave)
-returnVal = slaves
-"""
 
 # --------------------------------------------------
 #      Etherlab Specific Blocks Library
@@ -85,7 +56,7 @@ class EtherlabLibrary(POULibrary):
     def GetLibraryPath(self):
         return GetLocalPath("pous.xml")
 
-    def Generate_C(self, buildpath, varlist, IECCFLAGS):
+    def Generate_C(self, buildpath, pous_data, IECCFLAGS):
         etherlab_ext_file = open(GetLocalPath("etherlab_ext.c"), 'r')
         etherlab_ext_code = etherlab_ext_file.read()
         etherlab_ext_file.close()
@@ -96,7 +67,7 @@ class EtherlabLibrary(POULibrary):
         ethelabfile.close()
 
         return ((["etherlab_ext"], [(Gen_etherlabfile_path, IECCFLAGS)], True), "",
-                ("runtime_etherlab.py", open(GetLocalPath("runtime_etherlab.py"))))
+                ("runtime_etherlab.py", open(GetLocalPath("runtime_etherlab.py"), "rb")))
 
                 # TODO : rename to match runtime_{location}_extname.py format
 
@@ -110,9 +81,8 @@ EtherCATConfigParser = GenerateParserFromXSD(os.path.join(os.path.dirname(__file
 
 def sort_commands(x, y):
     if x["Index"] == y["Index"]:
-        return cmp(x["Subindex"], y["Subindex"])
-    return cmp(x["Index"], y["Index"])
-
+        return (x["Subindex"] > y["Subindex"]) - (x["Subindex"] < y["Subindex"])
+    return (x["Index"] > y["Index"]) - (x["Index"] < y["Index"])
 
 cls = EtherCATConfigParser.GetElementClass("Slave", "Config")
 if cls:
@@ -237,6 +207,30 @@ ProcessVariablesParser = GenerateParserFromXSDstring(ProcessVariablesXSD)
 
 class _EthercatCTN(object):
 
+    XSD = """<?xml version="1.0" encoding="ISO-8859-1" ?>
+    <xsd:schema xmlns:xsd="http://www.w3.org/2001/XMLSchema">
+      <xsd:element name="EtherCATParams">
+        <xsd:complexType>
+          <!-- Where the IgH EtherCAT master is installed, when it is not in
+               the compiler default search paths -->
+          <xsd:attribute name="Prefix" type="xsd:string" use="optional" default=""/>
+          <!-- Which flavour of the master library to link against. Default
+               follows the target of the project : RTDM on Xenomai, the
+               generic one everywhere else -->
+          <xsd:attribute name="RealTimeDriver" use="optional" default="Default">
+            <xsd:simpleType>
+              <xsd:restriction base="xsd:string">
+                <xsd:enumeration value="Default"/>
+                <xsd:enumeration value="Generic"/>
+                <xsd:enumeration value="RTDM"/>
+              </xsd:restriction>
+            </xsd:simpleType>
+          </xsd:attribute>
+        </xsd:complexType>
+      </xsd:element>
+    </xsd:schema>
+    """
+
     CTNChildrenTypes = [("EthercatSlave", _EthercatSlaveCTN, "Ethercat Slave")]
     if HAS_MCL:
         CTNChildrenTypes.append(("EthercatCIA402Slave", _EthercatCIA402SlaveCTN, "Ethercat CIA402 Slave"))
@@ -246,23 +240,28 @@ class _EthercatCTN(object):
         config_filepath = self.ConfigFileName()
         config_is_saved = False
         self.Config = None
-        # if os.path.isfile(config_filepath):
-        #     config_xmlfile = open(config_filepath, 'r')
-        #     try:
-        #         self.Config, error = \
-        #             EtherCATConfigParser.LoadXMLString(config_xmlfile.read())
-        #         if error is None:
-        #             config_is_saved = True
-        #     except Exception as e:
-        #         error = str(e)
-        #     config_xmlfile.close()
-
-        #     if error is not None:
-        #         self.GetCTRoot().logger.write_error(
-        #             _("Couldn't load %s network configuration file.") % self.CTNName())
-
         if self.Config is None:
             self.Config = EtherCATConfigParser.CreateElement("EtherCATConfig")
+            # set up the master description
+            config = self.Config.getConfig()
+
+            if config.getMaster() is None:
+                master = EtherCATConfigParser.CreateElement("Master", "Config")
+                config.appendMaster(master)
+            else:
+                master = config.getMaster()
+
+            if master.getInfo() is None:
+                master.addInfo()
+
+            info = master.getInfo()
+
+            # source and destination are integers, not strings
+            info.setSource(0x10)
+            info.setDestination(0x10)
+
+            if not info.getName():
+                info.setName("Master0")
 
         process_filepath = self.ProcessVariablesFileName()
         process_is_saved = False
@@ -300,12 +299,12 @@ class _EthercatCTN(object):
                 if error is None:
                     config_is_saved = True
             except Exception as e:
-                error = e.message
+                error = str(e)
             config_xmlfile.close()
             
             if error is not None:
                 self.GetCTRoot().logger.write_error(
-                    _("Couldn't load %s network configuration file.") % CTNName)
+                    _("Couldn't load %s network configuration file.") % self.CTNName())
 
         # ----------- call ethercat mng. function --------------
         self.CommonMethod = _CommonSlave(self)
@@ -315,6 +314,17 @@ class _EthercatCTN(object):
 
     def GetContextualMenuItems(self):
         return [(_("Add Ethercat Slave"), _("Add Ethercat Slave to Master"), self.OnAddEthercatSlave)]
+
+    def ensure_doc_recursive(self, node_list):
+        """The parameters editor expects a 'doc' entry on every node."""
+        if not node_list:
+            return
+        for node in node_list:
+            if not isinstance(node, dict):
+                continue
+            node.setdefault("doc", None)
+            if isinstance(node.get("children"), list):
+                self.ensure_doc_recursive(node["children"])
 
     def OnAddEthercatSlave(self, event):
         app_frame = self.GetCTRoot().AppFrame
@@ -332,7 +342,9 @@ class _EthercatCTN(object):
                 new_child = self.CTNAddChild("%s_0" % ConfNodeType, ConfNodeType)
                 new_child.SetParamsAttribute("SlaveParams.Type", type_infos)
                 self.CTNRequestSave()
+                self.ensure_doc_recursive(getattr(new_child, "ConfNodeParams", []))
                 new_child._OpenView()
+
                 app_frame._Refresh(TITLE, FILEMENU, PROJECTTREE)
         dialog.Destroy()
 
@@ -464,48 +476,151 @@ class _EthercatCTN(object):
             idx += 1
         return variables
 
+    def ScannedSlaveType(self, slave):
+        """
+        Identity of a scanned slave, in the form GetModuleInfos expects.
+        @param slave: one entry of what the "scan" command returned
+        @return type_infos, None when no ESI file describes that device
+        """
+        type_infos = {"vendor": slave["vendor_id"],
+                      "product_code": slave["product_code"],
+                      "revision_number": slave["revision_number"]}
+        device, _module_extra_params = self.GetModuleInfos(type_infos)
+        if device is None:
+            return None, None
+        type_infos["device_type"] = device.getType().getcontent()
+        return type_infos, device
+
+    def SameSlaveType(self, first, second):
+        """Compare two slave identities, whatever their number format."""
+        if first is None or second is None:
+            return False
+        for key in ["vendor", "product_code", "revision_number"]:
+            try:
+                if ExtractHexDecValue(first[key]) != ExtractHexDecValue(second[key]):
+                    return False
+            except (KeyError, ValueError):
+                return False
+        return True
+
     def _ScanNetwork(self):
+        """
+        Confront the configuration with what is really on the bus, and complete
+        it with the slaves it does not know yet.  Slaves already configured are
+        left untouched, so that their PDO selection, DC settings and startup
+        commands survive a scan.
+        """
         app_frame = self.GetCTRoot().AppFrame
+        logger = self.GetCTRoot().logger
 
-        execute = True
-        if len(self.Children) > 0:
-            dialog = wx.MessageDialog(
-                app_frame,
-                _("The current network configuration will be deleted.\nDo you want to continue?"),
-                _("Scan Network"),
-                wx.YES_NO | wx.ICON_QUESTION)
-            execute = dialog.ShowModal() == wx.ID_YES
-            dialog.Destroy()
+        try:
+            scanned = CallEtherCAT(self.GetCTRoot()._connector, "scan")
+        except EtherCATError as e:
+            logger.write_error(
+                _("Could not scan the EtherCAT network: %s\n") % str(e))
+            return
 
-        if execute:
-            error, returnVal = self.RemoteExec(SCAN_COMMAND, returnVal=None)
-            if error != 0:
-                dialog = wx.MessageDialog(app_frame, returnVal, _("Error"), wx.OK | wx.ICON_ERROR)
-                dialog.ShowModal()
-                dialog.Destroy()
-            elif returnVal is not None:
-                for child in self.IECSortedChildren():
-                    self._doRemoveChild(child)
+        if not scanned:
+            logger.write_warning(_("No EtherCAT slave found on the network\n"))
+            return
 
-                for slave in returnVal:
-                    type_infos = {
-                        "vendor": slave["vendor_id"],
-                        "product_code": slave["product_code"],
-                        "revision_number": slave["revision_number"],
-                    }
-                    device, _module_extra_params = self.GetModuleInfos(type_infos)
-                    if device is not None:
-                        if HAS_MCL and _EthercatCIA402SlaveCTN.NODE_PROFILE in device.GetProfileNumbers():
-                            CTNType = "EthercatCIA402Slave"
-                        else:
-                            CTNType = "EthercatSlave"
-                        self.CTNAddChild("slave%s" % slave["idx"], CTNType, slave["idx"])
-                        self.SetSlaveAlias(slave["idx"], slave["alias"])
-                        type_infos["device_type"] = device.getType().getcontent()
-                        self.SetSlaveType(slave["idx"], type_infos)
+        added = []
+        unchanged = []
+        unknown = []
+        mismatched = []
 
-                if app_frame:
-                    app_frame.RefreshProjectTree()
+        for slave in scanned:
+            position = slave["idx"]
+            type_infos, device = self.ScannedSlaveType(slave)
+
+            if type_infos is None:
+                unknown.append(slave)
+                continue
+
+            if HAS_MCL and str(_EthercatCIA402SlaveCTN.NODE_PROFILE) in device.GetProfileNumbers():
+                CTNType = "EthercatCIA402Slave"
+            else:
+                CTNType = "EthercatSlave"
+
+            child = self.GetChildByIECLocation((position, ))
+            if child is None:
+                self.CTNAddChild("slave%d" % position, CTNType, position)
+                self.SetSlaveType(position, type_infos)
+                added.append((position, type_infos["device_type"]))
+            elif self.SameSlaveType(self.GetSlaveType(position), type_infos):
+                unchanged.append((position, type_infos["device_type"]))
+            else:
+                mismatched.append((position, child, CTNType, type_infos))
+
+        scanned_positions = [slave["idx"] for slave in scanned]
+        missing = [(child.GetSlavePos(), child.CTNName())
+                   for child in self.IECSortedChildren()
+                   if child.GetSlavePos() not in scanned_positions]
+
+        for position, slave in [(slave["idx"], slave) for slave in unknown]:
+            logger.write_warning(
+                _("Scan: no ESI file for the device at position {a1} "
+                  "(vendor {a2}, product code {a3}, revision {a4}), left alone\n").
+                format(a1=position, a2=slave["vendor_id"],
+                       a3=slave["product_code"], a4=slave["revision_number"]))
+        for position, name in added:
+            logger.write(_("Scan: added slave {a1}, {a2}\n").
+                         format(a1=position, a2=name))
+        for position, name in unchanged:
+            logger.write(_("Scan: slave {a1} already configured as {a2}\n").
+                         format(a1=position, a2=name))
+        for position, name in missing:
+            logger.write_warning(
+                _("Scan: configured slave {a1} ({a2}) is not on the network, "
+                  "left in the configuration\n").format(a1=position, a2=name))
+
+        if mismatched:
+            self.ReplaceMismatchedSlaves(app_frame, mismatched)
+
+        if added or mismatched:
+            self.CTNRequestSave()
+            if app_frame:
+                app_frame.RefreshProjectTree()
+
+    def ReplaceMismatchedSlaves(self, app_frame, mismatched):
+        """
+        Ask before touching slaves that are configured as another device than
+        the one found at their position, then update the ones the user accepts.
+        @param mismatched: [(position, child, CTNType, type_infos), ...]
+        """
+        details = "\n".join(
+            [_("  position {a1}: configured as {a2}, found {a3}").format(
+                a1=position,
+                a2=(self.GetSlaveType(position) or {}).get("device_type", _("unknown")),
+                a3=type_infos["device_type"])
+             for position, _child, _CTNType, type_infos in mismatched])
+
+        dialog = wx.MessageDialog(
+            app_frame,
+            _("The following slaves are not the ones described in the "
+              "configuration:\n\n%s\n\nUpdate them? Their PDO selection will "
+              "be reset, since PDO indexes belong to the device.") % details,
+            _("Scan Network"),
+            wx.YES_NO | wx.ICON_QUESTION)
+        update = dialog.ShowModal() == wx.ID_YES
+        dialog.Destroy()
+
+        if not update:
+            return
+
+        for position, child, CTNType, type_infos in mismatched:
+            if child.CTNType != CTNType:
+                # plain slave and CiA402 slave are different confnode classes,
+                # the node has to be created again
+                name = child.CTNName()
+                self._doRemoveChild(child)
+                self.CTNAddChild(name, CTNType, position)
+            else:
+                params = child.GetSlaveParams()
+                if params is not None:
+                    params.setRxPDO("")
+                    params.setTxPDO("")
+            self.SetSlaveType(position, type_infos)
 
     def CTNAddChild(self, CTNName, CTNType, IEC_Channel=0):
         """
@@ -522,7 +637,6 @@ class _EthercatCTN(object):
             slave_infos = slave.getInfo()
             slave_infos.setName("undefined")
             slave_infos.setPhysAddr(newConfNodeOpj.BaseParams.getIEC_Channel())
-            slave_infos.setAutoIncAddr(0)
             self.BufferModel()
             self.OnCTNSave()
 
@@ -553,23 +667,23 @@ class _EthercatCTN(object):
                     write_to.setPosition(new_pos)
             self.CreateBuffer(True)
             self.CTNRequestSave()
-            if self._View is not None:
-                self._View.RefreshView()
-                self._View.RefreshBuffer()
+            if hasattr(self, "_View") and self._View:
+                # the view may be closing, or already destroyed
+                safe_to_refresh = True
+                if getattr(self._View, "_is_closing", False):
+                    safe_to_refresh = False
+                elif not hasattr(self._View, "ConfNodeName"):
+                    safe_to_refresh = False
+                elif self._View.ConfNodeName is None:
+                    safe_to_refresh = False
 
-    def GetSlaveAlias(self, slave_pos):
-        slave = self.GetSlave(slave_pos)
-        if slave is not None:
-            slave_info = slave.getInfo()
-            return slave_info.getAutoIncAddr()
-        return None
-
-    def SetSlaveAlias(self, slave_pos, alias):
-        slave = self.GetSlave(slave_pos)
-        if slave is not None:
-            slave_info = slave.getInfo()
-            slave_info.setAutoIncAddr(alias)
-            self.BufferModel()
+                if safe_to_refresh:
+                    try:
+                        self._View.RefreshView()
+                        self._View.RefreshBuffer()
+                    except RuntimeError:
+                        # widget unexpectedly destroyed, nothing to refresh
+                        pass
 
     def GetSlaveType(self, slave_pos):
         slave = self.GetSlave(slave_pos)
@@ -887,7 +1001,7 @@ class _EthercatCTN(object):
             self.Config,
             pretty_print=True,
             xml_declaration=True,
-            encoding='utf-8'))
+            encoding='utf-8').decode("utf-8"))
         config_xmlfile.close()
 
         process_filepath = self.ProcessVariablesFileName()
@@ -897,7 +1011,7 @@ class _EthercatCTN(object):
             self.ProcessVariables,
             pretty_print=True,
             xml_declaration=True,
-            encoding='utf-8'))
+            encoding='utf-8').decode("utf-8"))
         process_xmlfile.close()
 
         self.Buffer.CurrentSaved()
@@ -943,14 +1057,56 @@ class _EthercatCTN(object):
 
         self.FileGenerator.GenerateCFile(Gen_Ethercatfile_path, location_str, self.BaseParams.getIEC_Channel())
 
+        CFLAGS, master_LDFLAGS = self.GetEtherCATBuildFlags()
+
         LocationCFilesAndCFLAGS.insert(
             0,
             (current_location,
-             [(Gen_Ethercatfile_path, '"-I%s"' % os.path.abspath(self.GetCTRoot().GetIECLibPath()))],
+             [(Gen_Ethercatfile_path,
+               '"-I%s"' % os.path.abspath(self.GetCTRoot().GetIECLibPath()) + CFLAGS)],
              True))
-        LDFLAGS.append("-lethercat_rtdm -lrtdm")
+        LDFLAGS.extend(master_LDFLAGS)
 
         return LocationCFilesAndCFLAGS, LDFLAGS, extra_files
+
+    def UseRTDM(self):
+        """
+        Whether the realtime flavour of the master library is wanted. The
+        project target decides, unless the master says otherwise.
+        @return True when linking against libethercat_rtdm
+        """
+        driver = self.EtherCATParams.getRealTimeDriver()
+        if driver == "RTDM":
+            return True
+        if driver == "Generic":
+            return False
+        builder = self.GetCTRoot().GetBuilder()
+        return builder is not None and builder.GetTargetName() == "Xenomai"
+
+    def GetEtherCATBuildFlags(self):
+        """
+        Compiler and linker flags needed to build against the IgH EtherCAT
+        master library.
+        @return (CFLAGS string, LDFLAGS list)
+        """
+        CFLAGS = ""
+        LDFLAGS = []
+
+        prefix = self.EtherCATParams.getPrefix()
+        if prefix:
+            CFLAGS += ' "-I%s"' % os.path.join(prefix, "include")
+            LDFLAGS.append('"-L%s"' % os.path.join(prefix, "lib"))
+
+        if self.UseRTDM():
+            # plc_etherlab.c switches to the Xenomai timers and to LogMessage
+            CFLAGS += " -DUSE_XENOMAI"
+            LDFLAGS.append("-lethercat_rtdm -lrtdm")
+        else:
+            LDFLAGS.append("-lethercat")
+
+        LDFLAGS.append("-lm")
+
+        return CFLAGS, LDFLAGS
 
     ConfNodeMethods = [
         {

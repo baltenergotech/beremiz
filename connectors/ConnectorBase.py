@@ -16,7 +16,6 @@ class ConnectorBase(object):
         "StartPLC": False,
         "GetTraceVariables": (PlcStatus.Broken, None),
         "GetPLCstatus": (PlcStatus.Broken, None),
-        "RemoteExec": (-1, "RemoteExec script failed!"),
         "GetVersions": "*** Unknown ***"
     }
 
@@ -24,6 +23,9 @@ class ConnectorBase(object):
         s = hashlib.new('md5')
         s.update(seed.encode())
         blobID = self.SeedBlob(seed.encode())
+        if blobID is None:
+            # PLC declined to open a blob, and said why in the log.
+            raise IOError("PLC refused transfer")
         with open(filepath, "rb") as f:
             while blobID == s.digest():
                 chunk = f.read(self.chuncksize)

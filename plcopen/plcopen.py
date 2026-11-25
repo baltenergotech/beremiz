@@ -24,6 +24,7 @@
 # Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301, USA.
 
 
+import os
 import re
 from collections import OrderedDict
 
@@ -31,6 +32,7 @@ from lxml import etree
 
 from xmlclass import *
 import util.paths as paths
+import tc6_tree_convert
 
 
 #: Dictionary that makes the relation between var names
@@ -222,6 +224,17 @@ ActionBlocksXPath = PLCOpen_XPath("ppx:types/ppx:pous/ppx:pou/ppx:body/*/ppx:act
 ActionBlocksConnectionPointOutXPath = PLCOpen_XPath("ppx:connectionPointOut")
 
 
+def ClearZeroExecutionOrders(tree):
+    """ Remove execution orders of POUs where all of them are 0.
+    Beremiz used to write 0 for unspecified execution order, now unspecified one is absent,
+    and 0 is the first execution order """
+    for pou in tree.iter("{%s}pou" % PLCOpenParser.NSMAP["ppx"]):
+        elements = [e for e in pou.iter() if e.get("executionOrderId") is not None]
+        if elements and all(e.get("executionOrderId") == "0" for e in elements):
+            for element in elements:
+                del element.attrib["executionOrderId"]
+
+
 def LoadProjectXML(project_xml):
     project_xml = project_xml.replace(
         "http://www.plcopen.org/xml/tc6.xsd",
@@ -233,6 +246,7 @@ def LoadProjectXML(project_xml):
 
     try:
         tree, error = PLCOpenParser.LoadXMLString(project_xml)
+        ClearZeroExecutionOrders(tree)
         if error is None:
             return tree, None
 
@@ -301,10 +315,30 @@ def LoadProjectXML(project_xml):
 
 
 def LoadProject(filepath):
+    if os.path.isdir(filepath):
+        return LoadProjectTree(filepath)
     project_file = open(filepath, encoding='utf-8')
     project_xml = project_file.read()
     project_file.close()
     return LoadProjectXML(project_xml)
+
+
+def LoadProjectTree(dirpath):
+    """ Load project from a directory of IEC 61131-3 text files.
+    Validation error is (file, line, message), with file as plc/file.st """
+    try:
+        project_xml = tc6_tree_convert.load(dirpath)
+        # no legacy formats to update, nor CDATA to fix, as in LoadProjectXML
+        tree, error = PLCOpenParser.LoadXMLString(project_xml)
+        ClearZeroExecutionOrders(tree)
+    except Exception as e:
+        return None, str(e)
+    if error is not None:
+        line, message = error
+        location = tc6_tree_convert.locate(dirpath, line)
+        if location is not None:
+            error = (os.path.join(os.path.basename(dirpath), location[0]), location[1], message)
+    return tree, error
 
 
 project_pou_xpath = PLCOpen_XPath("/ppx:project/ppx:types/ppx:pous/ppx:pou")
@@ -336,6 +370,11 @@ def SaveProject(project, filepath):
 
     assert len(content) != 0
         
+    if os.path.isdir(filepath):
+        # directory of IEC 61131-3 text files, raise tc6_tree_convert.ConversionError
+        tc6_tree_convert.save(content, filepath)
+        return
+
     project_file = open(filepath, 'w', encoding='utf-8')
     project_file.write(content)
     project_file.close()
@@ -1836,7 +1875,7 @@ def _updateBodyClass(cls):
                 if not isinstance(element, (PLCOpenParser.GetElementClass("comment", "commonObjects"),
                                             PLCOpenParser.GetElementClass("connector", "commonObjects"),
                                             PLCOpenParser.GetElementClass("continuation", "commonObjects"))):
-                    element.setexecutionOrderId(0)
+                    element.setexecutionOrderId(None)
             self.checkedBlocksDict.clear()
         else:
             raise TypeError(_("Can only generate execution order on FBD networks!"))
@@ -1847,7 +1886,7 @@ def _updateBodyClass(cls):
             self.resetexecutionOrder()
             self.resetcurrentExecutionOrderId()
             for element in self.content.getcontent():
-                if isinstance(element, PLCOpenParser.GetElementClass("outVariable", "fbdObjects")) and element.getexecutionOrderId() == 0:
+                if isinstance(element, PLCOpenParser.GetElementClass("outVariable", "fbdObjects")) and element.getexecutionOrderId() is None:
                     connections = element.connectionPointIn.getconnections()
                     if connections and len(connections) == 1:
                         self.compileelementExecutionOrder(connections[0])
@@ -1861,19 +1900,19 @@ def _updateBodyClass(cls):
             localid = link.getrefLocalId()
             instance = self.getcontentInstance(localid)
             self.checkedBlocksDict[localid] = True
-            if isinstance(instance, PLCOpenParser.GetElementClass("block", "fbdObjects")) and instance.getexecutionOrderId() == 0:
+            if isinstance(instance, PLCOpenParser.GetElementClass("block", "fbdObjects")) and instance.getexecutionOrderId() is None:
                 for variable in instance.inputVariables.getvariable():
                     connections = variable.connectionPointIn.getconnections()
                     if connections and len(connections) == 1:
                         if not connections[0].getrefLocalId() in self.checkedBlocksDict:
                             self.compileelementExecutionOrder(connections[0])
-                if instance.getexecutionOrderId() == 0:
+                if instance.getexecutionOrderId() is None:
                     instance.setexecutionOrderId(self.getnewExecutionOrderId())
-            elif isinstance(instance, PLCOpenParser.GetElementClass("continuation", "commonObjects")) and instance.getexecutionOrderId() == 0:
+            elif isinstance(instance, PLCOpenParser.GetElementClass("continuation", "commonObjects")) and instance.getexecutionOrderId() is None:
                 for tmp_instance in self.getcontentInstances():
                     if isinstance(tmp_instance, PLCOpenParser.GetElementClass("connector", "commonObjects")) and \
                        TextMatched(tmp_instance.getname(), instance.getname()) and \
-                       tmp_instance.getexecutionOrderId() == 0:
+                       tmp_instance.getexecutionOrderId() is None:
                         connections = tmp_instance.connectionPointIn.getconnections()
                         if connections and len(connections) == 1:
                             self.compileelementExecutionOrder(connections[0])
@@ -1884,10 +1923,12 @@ def _updateBodyClass(cls):
     def setelementExecutionOrder(self, instance, new_executionOrder):
         if self.content.getLocalTag() == "FBD":
             old_executionOrder = instance.getexecutionOrderId()
-            if old_executionOrder is not None and old_executionOrder != 0 and new_executionOrder != 0:
+            if old_executionOrder is not None and new_executionOrder is not None:
                 for element in self.content.getcontent():
                     if element != instance and not isinstance(element, PLCOpenParser.GetElementClass("comment", "commonObjects")):
                         element_executionOrder = element.getexecutionOrderId()
+                        if element_executionOrder is None:
+                            continue
                         if old_executionOrder <= element_executionOrder <= new_executionOrder:
                             element.setexecutionOrderId(element_executionOrder - 1)
                         if new_executionOrder <= element_executionOrder <= old_executionOrder:
@@ -2907,5 +2948,5 @@ def _updateStructValueValueClass(cls):
 
 cls = PLCOpenParser.GetElementClass("structValue", "value")
 if cls:
-    structValue_model = re.compile("(.*):=(.*)")
+    structValue_model = re.compile("(.*?):=(.*)")
     _updateStructValueValueClass(cls)

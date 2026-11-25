@@ -25,18 +25,15 @@ class PythonLibrary(POULibrary):
     def SupportsTarget(self, target):
         return target.GetTargetName() != "Zephyr"
     
-    def Generate_C(self, buildpath, varlist, IECCFLAGS):
+    def Generate_C(self, buildpath, pous_data, IECCFLAGS):
 
         plc_python_filepath = paths.AbsNeighbourFile(__file__, "plc_python.c")
         plc_python_file = open(plc_python_filepath, 'r')
         plc_python_code = plc_python_file.read()
         plc_python_file.close()
-        python_eval_fb_list = []
-        for v in varlist:
-            if v["vartype"] == "FB" and v["type"] in ["PYTHON_EVAL",
-                                                      "PYTHON_POLL"]:
-                python_eval_fb_list.append(v)
-        python_eval_fb_count = max(1, len(python_eval_fb_list))
+
+        python_eval_fb_count = max(1, pous_data.count_fb_instances(
+            {"PYTHON_EVAL", "PYTHON_POLL"}))
 
         # prepare python code
         plc_python_code = plc_python_code % {

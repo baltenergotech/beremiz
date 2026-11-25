@@ -11,19 +11,13 @@
 #     Use cases :
 #
 #       run given tests
-#           $ make run_python_exemple.sikuli
+#           $ make run_python_exemple.pytest
 #
 #       run tests from particular test classes
 #           $ make ide_tests
 #
-#       run one particular test in a Xnest window
-#           $ make xnest_run_python_exemple.sikuli
-#
-#       run Xnest window with just xterm
-#           $ make xnest_xterm
-#
-#       run Xnest window with sikuli IDE and xterm
-#           $ make xnest_sikuli
+#       run IDE displayed in your browser, to help writing IDE tests
+#           $ make ide_session ide_session_project=exemples/python
 #
 #       build minimal beremiz and matiec to run tests
 #           $ make built_apps
@@ -38,9 +32,8 @@
 #   $(test_dir) defaults to $(HOME)/test and can be overloaded:
 #       $ make test_dir=${HOME}/other_test_dir
 #
-#   Makefile attemps to use xvfb-run to run each test individually with its own
-#   X server instance. This behavior can be overloaded
-#       $ DISPLAY=:42 make xserver_command='echo "Using $DISPLAY X Server !";'
+#   IDE tests run headless, IDE being displayed with GTK Broadway backend in
+#   a browser driven by Playwright. See ide_tests/ide_harness.py
 #
 #   Matiec and Beremiz code are expected to be clean, ready to build
 #   Any change in Matiec directory triggers rebuild of matiec.
@@ -55,7 +48,7 @@
 #       of the Beremiz directory $(src)/beremiz, where we run tests from.
 #   
 
-all: source_check cli_tests ide_tests runtime_tests 
+all: source_check cli_tests ide_tests runtime_tests tc6_tree_convert_tests
 
 # Variable $(src) is directory such that executed 
 # $(src)/Makefile is this file.
@@ -71,7 +64,7 @@ build_dir = $(test_dir)/build
 # SOURCE and BUILD
 #
 
-BUILT_PROJECTS=beremiz matiec open62541 Modbus erpc
+BUILT_PROJECTS=beremiz matiec open62541 Modbus erpc paho.mqtt.c frozen
 
 tar_opts=--absolute-names --exclude=.hg --exclude=.git --exclude=.*.pyc --exclude=.*.swp
 
@@ -102,18 +95,32 @@ $(build_dir)/matiec/iec2c: $(build_dir)/matiec/$(matiec_checksum).sha1
 $(build_dir)/open62541/build/bin/libopen62541.a: $(build_dir)/open62541/$(open62541_checksum).sha1
 	cd $(build_dir)/open62541 && \
     rm -rf build && mkdir build && cd build && \
-	cmake -D UA_ENABLE_ENCRYPTION=OPENSSL .. && \
+	cmake -D UA_ENABLE_ENCRYPTION=OPENSSL -D CMAKE_POSITION_INDEPENDENT_CODE=ON .. && \
 	make
 
 $(build_dir)/Modbus/libmb.a: | $(build_dir)/Modbus/$(Modbus_checksum).sha1
 	cd $(build_dir)/Modbus && \
 	make
 
+$(build_dir)/paho.mqtt.c/build/src/libpaho-mqtt3cs.a: $(build_dir)/paho.mqtt.c/$(paho.mqtt.c_checksum).sha1
+	cd $(build_dir)/paho.mqtt.c && \
+	rm -rf build && mkdir build && cd build && \
+	cmake .. -DPAHO_BUILD_STATIC=TRUE -DPAHO_WITH_SSL=TRUE && \
+	make
+
+$(build_dir)/frozen/frozen.stamp: $(build_dir)/frozen/$(frozen_checksum).sha1
+	touch $@
+
 $(build_dir)/beremiz/C_runtime/beremiz_runtime: $(build_dir)/erpc/$(erpc_checksum).sha1
 	cd $(build_dir)/beremiz/C_runtime && \
 	make
 
-built_apps: $(build_dir)/matiec/iec2c $(build_dir)/beremiz/$(beremiz_checksum).sha1 $(build_dir)/open62541/build/bin/libopen62541.a $(build_dir)/Modbus/libmb.a $(build_dir)/beremiz/C_runtime/beremiz_runtime
+built_apps: $(build_dir)/matiec/iec2c $(build_dir)/beremiz/$(beremiz_checksum).sha1 \
+			$(build_dir)/open62541/build/bin/libopen62541.a \
+			$(build_dir)/Modbus/libmb.a \
+			$(build_dir)/paho.mqtt.c/build/src/libpaho-mqtt3cs.a \
+			$(build_dir)/frozen/frozen.stamp \
+			$(build_dir)/beremiz/C_runtime/beremiz_runtime
 	touch $@
 
 define log_command
@@ -131,66 +138,41 @@ endef
 #
 
 ide_test_dir = $(src)/ide_tests
-sikuli_ide_tests = $(subst $(ide_test_dir)/,,$(wildcard $(ide_test_dir)/*.sikuli))
 pytest_ide_tests = $(subst $(ide_test_dir)/,,$(wildcard $(ide_test_dir)/*.pytest))
 
 fluxbox_command ?= echo "session.screen0.toolbar.placement: TopCenter" > fluxbox_init; (fluxbox -rc fluxbox_init >/dev/null 2>&1 &)
-
-define sikuli_idetest_command
-	$(fluxbox_command); BEREMIZPATH=$(build_dir)/beremiz sikulix -r $(src)/ide_tests/$(1)
-endef
-
 
 DELAY=400
 KILL_DELAY=430
 PYTEST=$(dir $(BEREMIZPYTHONPATH))pytest
 define pytest_idetest_command
-	$(fluxbox_command); PYTHONPATH=$(ide_test_dir) timeout -k $(KILL_DELAY) $(DELAY) $(PYTEST) --maxfail=1 --timeout=100  $(src)/ide_tests/$(1)
+	BEREMIZPATH=$(build_dir)/beremiz PYTHONPATH=$(ide_test_dir) timeout -k $(KILL_DELAY) $(DELAY) $(PYTEST) --maxfail=1 --timeout=100  $(src)/ide_tests/$(1)
 endef
 
-# Xnest based interactive sessions for tests edit and debug. 
-# Would be nice with something equivalent to xvfb-run, waiting for USR1.
-# Arbitrary "sleep 1" is probably enough for interactive use
-define xnest_run
-	Xnest :42 -geometry 1920x1080+0+0 & export xnestpid=$$!; sleep 1; DISPLAY=:42 $(1); export res=$$?; kill $${xnestpid} 2>/dev/null; exit $${res}
-endef
 
-xserver_command ?= xvfb-run -s '-screen 0 1920x1080x24'
-
-define make_idetest_rule
+define make_pytest_idetest_rule
 $(test_dir)/$(1)_results/.passed: built_apps
-	$(call prep_test,$(1)); $(xserver_command) bash -c '$(call log_command,$(2),$(1))'
+	$(call prep_test,$(1)); bash -c '$(call log_command,$(2),$(1))'
 	touch $$@
 
-# Manually invoked rule {testname}.sikuli
+# Manually invoked rule {testname}.pytest
 $(1): $(test_dir)/$(1)_results/.passed
-
-# Manually invoked rule xnest_{testname}.sikuli
-# runs test in xnest so that one can see what happens
-xnest_$(1): built_apps
-	$(call prep_test,$(1)); $$(call xnest_run, bash -c '$(call log_command,$(2),$(1))')
 
 ide_tests_targets += $(test_dir)/$(1)_results/.passed
 endef
-$(foreach idetest,$(sikuli_ide_tests),$(eval $(call make_idetest_rule,$(idetest),sikuli_idetest_command)))
-$(foreach idetest,$(pytest_ide_tests),$(eval $(call make_idetest_rule,$(idetest),pytest_idetest_command)))
+$(foreach idetest,$(pytest_ide_tests),$(eval $(call make_pytest_idetest_rule,$(idetest),pytest_idetest_command)))
 
 ide_tests : $(ide_tests_targets)
 	echo "$(ide_tests_targets) : Passed"
 
-xnest_xterm: built_apps
-	$(call xnest_run, bash -c '$(fluxbox_command);xterm')
+pytest_ide_tests_targets = $(patsubst %,$(test_dir)/%_results/.passed,$(pytest_ide_tests))
 
-xnest_sikuli: built_apps
-	$(call xnest_run, bash -c '$(fluxbox_command);(BEREMIZPATH=$(build_dir)/beremiz xterm -e sikulix &);xterm')
+pytest_ide_tests : $(pytest_ide_tests_targets)
+	echo "$(pytest_ide_tests_targets) : Passed"
 
-xvfb_sikuli: built_apps
-	echo "******************************************"
-	echo "On host, run 'xvncviewer 127.0.0.1:5900' to see sikuli X session"
-	echo "Docker container must be created with TESTDEBUG=YES. For example :"
-	echo "./clean_docker_container.sh && ./build_docker_image.sh && TESTDEBUG=YES ./create_docker_container.sh && ./do_test_in_docker.sh xvfb_sikuli"
-	echo "******************************************"
-	$(xserver_command) bash -c '(fluxbox &);(x11vnc &);(BEREMIZPATH=$(build_dir)/beremiz xterm -e sikulix &);xterm'
+# Interactive IDE session, to help writing IDE tests. See ide_tests/ide_session.py
+ide_session: built_apps
+	BEREMIZPATH=$(build_dir)/beremiz PYTHONPATH=$(ide_test_dir) $(BEREMIZPYTHONPATH) $(ide_test_dir)/ide_session.py $(ide_session_project)
 
 #
 # CLI TESTS
@@ -205,7 +187,7 @@ endef
 
 define make_clitest_rule
 $(test_dir)/$(1)_results/.passed: built_apps
-	$(call prep_test,$(1)); bash -c '$(call log_command,$(2),$(1))'
+	$(call prep_test,$(1)); timeout 600 bash -c '$(call log_command,$(2),$(1))' || (echo "Test $(1) timed out or failed"; exit 1)
 	touch $$@
 
 # Manually invoked rule
@@ -217,6 +199,23 @@ $(foreach clitest,$(cli_tests),$(eval $(call make_clitest_rule,$(clitest),clites
 
 cli_tests: $(cli_tests_targets)
 	echo "$(cli_tests_targets) : Passed"
+
+#
+# TC6 TREE CONVERTER TESTS (plc.xml <-> plc/ directory)
+#
+
+define tc6_tree_convert_command
+	$(PYTEST) $(build_dir)/beremiz/tc6_tree_convert/tests
+endef
+
+define make_tc6_tree_convert_rule
+$(test_dir)/$(1)_results/.passed: $(build_dir)/beremiz/$(beremiz_checksum).sha1
+	$(call prep_test,$(1)); timeout 600 bash -c '$(call log_command,$(2),$(1))'
+	touch $$@
+
+$(1): $(test_dir)/$(1)_results/.passed
+endef
+$(eval $(call make_tc6_tree_convert_rule,tc6_tree_convert_tests,tc6_tree_convert_command))
 
 clean_results:
 	rm -rf $(test_dir)/*_results

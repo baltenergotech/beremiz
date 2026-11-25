@@ -23,9 +23,6 @@
 # Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301, USA.
 
 
-import os
-import sys
-import getopt
 from functools import reduce
 
 # Translation between IEC types and Can Open types
@@ -58,6 +55,11 @@ InvertPDOType = {RPDO: TPDO, TPDO: RPDO}
 PDOTypeBaseIndex = {RPDO: 0x1400, TPDO: 0x1800}
 PDOTypeBaseCobId = {RPDO: 0x200, TPDO: 0x180}
 
+# Bit 31 of a PDO COB ID entry, set while the PDO does not exist (CiA 301).
+# The other flag bits of that entry (RTR forbidden, 29 bit identifier) belong
+# to the PDO itself and have to be left alone.
+PDO_NOT_VALID = 0x80000000
+
 VariableIncrement = 0x100
 VariableStartIndex = {TPDO: 0x2000, RPDO: 0x4000}
 VariableDirText = {TPDO: "__I", RPDO: "__Q"}
@@ -79,13 +81,16 @@ def LE_to_BE(value, size):
     Convert Little Endian to Big Endian
     @param value: value expressed in integer
     @param size: number of bytes generated
-    @return: a string containing the value converted
+    @return: a bytes object containing the value converted
+
+    Matches objdictgen/node.py:LE_to_BE so concise-DCF blobs are stored as
+    bytes, consistent with the rest of the (Python 3) CanFestival stack.
     """
 
     data = ("%" + str(size * 2) + "." + str(size * 2) + "X") % value
     list_car = [data[i:i+2] for i in range(0, len(data), 2)]
     list_car.reverse()
-    return "".join([chr(int(car, 16)) for car in list_car])
+    return bytes([int(car, 16) for car in list_car])
 
 
 def GetNodePDOIndexes(node, type, parameters=False):
@@ -128,6 +133,45 @@ def SearchNodePDOMapping(loc_infos, node):
     return None
 
 
+def PDOFullyDriven(node, pdoidx, pdotype, driven):
+    """
+    Tell whether the master fills every entry of a PDO the slave already maps
+    @param node: node
+    @param pdoidx: index of the PDO mapping
+    @param pdotype: type of that PDO, seen from the slave
+    @param driven: set of (index, subindex) this configuration reads or writes
+    on that node
+    @return: True when no trash variable is needed to keep the offsets
+
+    An entry the master cannot fill gets a trash variable, so that the entries
+    it does fill keep their offset. A trash variable is zero for ever, which
+    costs nothing in a PDO the master receives, but a PDO it transmits carries
+    it to the slave. CiA402 drives usually ship Controlword mapped along with
+    each setpoint, so the PDOs the setpoints are taken from would clear the
+    Controlword the master writes to the one it took Controlword from.
+    """
+
+    values = node.GetEntry(pdoidx)
+    if values is None:
+        return False
+
+    for value in values[1:]:
+        if value == 0:
+            continue
+        index, subindex = value >> 16, (value >> 8) & 0xFF
+        if (index, subindex) not in driven:
+            return False
+        # only the first PDO mapping an object is read from, the object is a
+        # trash variable in the others
+        result = SearchNodePDOMapping({"index": index,
+                                       "subindex": subindex,
+                                       "pdotype": pdotype}, node)
+        if result is None or result[0] != pdoidx:
+            return False
+
+    return True
+
+
 def GeneratePDOMappingDCF(idx, cobid, transmittype, pdomapping):
     """
     Build concise DCF value for configuring a PDO
@@ -141,7 +185,7 @@ def GeneratePDOMappingDCF(idx, cobid, transmittype, pdomapping):
     dcfdata = []
     # Create entry for RPDO or TPDO parameters and Disable PDO
     #           ---- INDEX -----   --- SUBINDEX ----   ----- SIZE ------   ------ DATA ------
-    dcfdata += [LE_to_BE(idx, 2) + LE_to_BE(0x01, 1) + LE_to_BE(0x04, 4) + LE_to_BE(0x80000000 + cobid, 4)]
+    dcfdata += [LE_to_BE(idx, 2) + LE_to_BE(0x01, 1) + LE_to_BE(0x04, 4) + LE_to_BE(PDO_NOT_VALID | cobid, 4)]
     # Set Transmit type
     dcfdata += [LE_to_BE(idx, 2) + LE_to_BE(0x02, 1) + LE_to_BE(0x01, 4) + LE_to_BE(transmittype, 1)]
     if len(pdomapping) > 0:
@@ -155,7 +199,7 @@ def GeneratePDOMappingDCF(idx, cobid, transmittype, pdomapping):
         dcfdata += [LE_to_BE(idx + 0x200, 2) + LE_to_BE(0x00, 1) + LE_to_BE(0x01, 4) + LE_to_BE(len(pdomapping), 1)]
     # Re-Enable PDO
     dcfdata += [LE_to_BE(idx, 2) + LE_to_BE(0x01, 1) + LE_to_BE(0x04, 4) + LE_to_BE(cobid, 4)]
-    return "".join(dcfdata), len(dcfdata)
+    return b"".join(dcfdata), len(dcfdata)
 
 
 class ConciseDCFGenerator(object):
@@ -198,8 +242,7 @@ class ConciseDCFGenerator(object):
         for PdoIdx in nodeRpdoIndexes + nodeTpdoIndexes:
             pdo_cobid = node.GetEntry(PdoIdx, 0x01)
             # Extract COB ID, if PDO isn't active
-            if pdo_cobid > 0x600:
-                pdo_cobid -= 0x80000000
+            pdo_cobid &= ~PDO_NOT_VALID
             # Remove COB ID from the list of available COB ID
             if pdo_cobid in self.ListCobIDAvailable:
                 self.ListCobIDAvailable.remove(pdo_cobid)
@@ -213,7 +256,7 @@ class ConciseDCFGenerator(object):
 
         # Adding DCF entry into Master node
         if not self.MasterNode.IsEntry(0x1F22):
-            self.MasterNode.AddEntry(0x1F22, 1, "")
+            self.MasterNode.AddEntry(0x1F22, 1, b"")
         self.Manager.AddSubentriesToCurrent(0x1F22, 127, self.MasterNode)
 
         # Adding trash mappable variables for unused mapped datas
@@ -269,11 +312,16 @@ class ConciseDCFGenerator(object):
         # Get current DCF for slave
         nodeDCF = self.MasterNode.GetEntry(0x1F22, nodeid)
 
+        # Concise DCF is binary data: normalize the (possibly empty/default)
+        # current value to bytes before appending.
+        if isinstance(nodeDCF, str):
+            nodeDCF = nodeDCF.encode("latin-1")
+
         # Extract data and number of params in current DCF
-        if nodeDCF is not None and nodeDCF != '':
-            tmpnbparams = [i for i in nodeDCF[:4]]
+        if nodeDCF:
+            tmpnbparams = list(nodeDCF[:4])
             tmpnbparams.reverse()
-            nbparams += int(''.join(["%2.2x" % ord(i) for i in tmpnbparams]), 16)
+            nbparams += int(''.join(["%2.2x" % b for b in tmpnbparams]), 16)
             data = nodeDCF[4:] + data
 
         # Build new DCF
@@ -283,11 +331,29 @@ class ConciseDCFGenerator(object):
 
     def GetEmptyPDO(self, nodeid, pdotype, start_index=None):
         """
-        Search a not configured PDO for a slave
+        Search a PDO of a slave whose mapping can be defined
         @param node: the slave node object
         @param pdotype: type of PDO to generated (RPDO or TPDO)
         @param start_index: Index where search must start (default: None)
         @return tuple of PDO index, COB ID and number of subindex defined
+
+        A PDO with an empty mapping is used first. Drives usually ship with
+        every PDO already mapped though, so when none is left, a PDO no other
+        variable needs is taken over : the concise DCF rewrites its mapping,
+        which is what a CANopen configuration tool would do.
+        """
+        for reuse_mapped in (False, True):
+            result = self.SearchConfigurablePDO(nodeid, pdotype, start_index,
+                                                reuse_mapped)
+            if result is not None:
+                return result
+        return None
+
+    def SearchConfigurablePDO(self, nodeid, pdotype, start_index, reuse_mapped):
+        """
+        @param reuse_mapped: also accept a PDO that the slave already maps, as
+        long as no variable of this configuration is read from it
+        @return same tuple as GetEmptyPDO, None when no PDO matches
         """
         # If no start_index defined, start with PDOtype base index
         if start_index is None:
@@ -301,18 +367,29 @@ class ConciseDCFGenerator(object):
             values = self.NodeList.GetSlaveNodeEntry(nodeid, index + 0x200)
             if values is not None and values[0] > 0:
                 # Check that all subindex upper than 0 equal 0 => configurable PDO
-                if reduce(lambda x, y: x and y, [x == 0 for x in values[1:]], True):
-                    cobid = self.NodeList.GetSlaveNodeEntry(nodeid, index, 1)
-                    # If no COB ID defined in PDO, generate a new one (not used)
-                    if cobid == 0:
-                        if len(self.ListCobIDAvailable) == 0:
-                            return None
-                        # Calculate COB ID from standard values
-                        if index < PDOTypeBaseIndex[pdotype] + 4:
-                            cobid = PDOTypeBaseCobId[pdotype] + 0x100 * (index - PDOTypeBaseIndex[pdotype]) + nodeid
-                        if cobid not in self.ListCobIDAvailable:
-                            cobid = self.ListCobIDAvailable.pop(0)
-                    return index, cobid, values[0]
+                empty = reduce(lambda x, y: x and y, [x == 0 for x in values[1:]], True)
+                cobid = self.NodeList.GetSlaveNodeEntry(nodeid, index, 1)
+                # A disabled PDO carries the invalid bit in its COB ID. It gets
+                # re-enabled by the concise DCF, keep the COB ID itself.
+                if cobid is not None:
+                    cobid &= ~PDO_NOT_VALID
+                # Taking over a mapped PDO must not steal the process data
+                # another variable is already read from
+                if not empty and not (reuse_mapped and cobid not in self.MasterMapping):
+                    index += 1
+                    continue
+                # If no COB ID defined in PDO, generate a new one (not used)
+                if cobid == 0:
+                    if len(self.ListCobIDAvailable) == 0:
+                        return None
+                    # Calculate COB ID from standard values
+                    if index < PDOTypeBaseIndex[pdotype] + 4:
+                        cobid = PDOTypeBaseCobId[pdotype] + 0x100 * (index - PDOTypeBaseIndex[pdotype]) + nodeid
+                    if cobid not in self.ListCobIDAvailable:
+                        cobid = self.ListCobIDAvailable.pop(0)
+                # values[0] holds how many entries the slave maps, which is not
+                # the room there is when the mapping is being rewritten
+                return index, cobid, values[0] if empty else len(values) - 1
             index += 1
         return None
 
@@ -371,6 +448,13 @@ class ConciseDCFGenerator(object):
                 # Extract and check nodeid
                 nodeid, index, subindex = loc[:3]
 
+                # Index 0 is reserved for the located variables a confnode
+                # provides itself rather than through the object dictionary,
+                # such as the network position and the AXIS_REF of a CiA402
+                # axis. Mirrors the same rule in LocalODPointers.
+                if index == 0:
+                    continue
+
                 # Check Id is in slave node list
                 if nodeid not in list(self.NodeList.SlaveNodes.keys()):
                     raise PDOmappingException(
@@ -428,11 +512,29 @@ class ConciseDCFGenerator(object):
         #                         Search for locations already mapped
         # -------------------------------------------------------------------------------
 
+        # Objects of each node this configuration drives, to tell a PDO the
+        # master fills entirely from one where it would need trash variables
+        driven = {}
+        for locationinfos in self.IECLocations.values():
+            driven.setdefault(locationinfos["nodeid"], set()).add(
+                (locationinfos["index"], locationinfos["subindex"]))
+
         for name, locationinfos in list(self.IECLocations.items()):
             node = self.NodeList.SlaveNodes[locationinfos["nodeid"]]["Node"]
 
             # Search if slave has a PDO mapping this locations
             result = SearchNodePDOMapping(locationinfos, node)
+
+            # A slave RPDO is transmitted by the master, so it can be kept as
+            # the slave maps it only when the master fills all of it. When it
+            # cannot, the location is left to the mapping generation below,
+            # which takes the PDO over and rewrites its mapping. A slave TPDO
+            # is only read, trash variables in it are harmless.
+            if result is not None and locationinfos["pdotype"] == RPDO and \
+               not PDOFullyDriven(node, result[0], RPDO,
+                                  driven[locationinfos["nodeid"]]):
+                result = None
+
             if result is not None:
                 index, subindex = result
                 # Get COB ID of the PDO
@@ -485,7 +587,7 @@ class ConciseDCFGenerator(object):
 
             # Initialize number of params and data to add to node DCF
             nbparams = 0
-            dataparams = ""
+            dataparams = b""
 
             # Generate the best PDO mapping for each type of PDO
             for pdotype in (TPDO, RPDO):
@@ -674,6 +776,12 @@ def LocalODPointers(locations, current_location, slave):
             # Extract and check nodeid
             index, subindex = loc[:2]
 
+            # Index 0 is reserved for the per-node diagnostic located variables
+            # (CAN controller state / error counters), which are not OD entries
+            # and are handled by the generated glue, not the OD pointer table.
+            if index == 0:
+                continue
+
             # Extract and check index and subindex
             if not slave.IsEntry(index, subindex):
                 raise PDOmappingException(
@@ -696,6 +804,10 @@ def LocalODPointers(locations, current_location, slave):
 
 
 if __name__ == "__main__":  # pylint: disable=all
+    import os
+    import sys
+    import getopt
+    
     def usage():
         print("""
 Usage of config_utils.py test :
@@ -731,12 +843,16 @@ Options:
         elif o in ("-r", "--reset"):
             reset = True
 
-    # Extract workspace base folder
-    base_folder = sys.path[0]
-    for i in range(3):
-        base_folder = os.path.split(base_folder)[0]
-    # Add CanFestival folder to search pathes
-    sys.path.append(os.path.join(base_folder, "CanFestival-3", "objdictgen"))
+    # The objdictgen modules use _() at runtime; install a no-op gettext
+    # builtin that Beremiz normally provides globally.
+    import builtins
+    builtins.__dict__.setdefault('_', lambda x: x)
+
+    # Make the beremiz checkout importable so we can reuse ThirdPartyPath,
+    # then add the sibling canfestival objdictgen folder to the search path.
+    sys.path.append(os.path.split(sys.path[0])[0])
+    import util.paths as paths
+    sys.path.append(paths.ThirdPartyPath("canfestival", "objdictgen"))
 
     from nodemanager import *
     from nodelist import *
@@ -746,18 +862,18 @@ Options:
     nodelist = NodeList(manager)
     result = nodelist.LoadProject("test_config")
 
-    # List of locations, we try to map for test
+    # List of locations to map for test. Limited to objects that PEAK MicroMod
+    # actually pre-maps in its PDOs (NrOfRXPDO=NrOfTXPDO=4, with 0x1A03/0x1603
+    # declaring zero sub-entries): the old result.txt assumed extra PDOs at
+    # 0x1A04+ could be created, which PEAK doesn't support. The kept locations
+    # exercise the "already mapped" DCF path (transmit-type rewrite + master
+    # mapping aggregation), which is what the Python 3 bytes changes touch.
     locations = [
         {"IEC_TYPE": "BYTE",  "NAME": "__IB0_1_64_24576_1", "DIR": "I", "SIZE": "B", "LOC": (0, 1, 64, 24576, 1)},
         {"IEC_TYPE": "INT",   "NAME": "__IW0_1_64_25601_2", "DIR": "I", "SIZE": "W", "LOC": (0, 1, 64, 25601, 2)},
         {"IEC_TYPE": "INT",   "NAME": "__IW0_1_64_25601_3", "DIR": "I", "SIZE": "W", "LOC": (0, 1, 64, 25601, 3)},
-        {"IEC_TYPE": "INT",   "NAME": "__QW0_1_64_25617_2", "DIR": "Q", "SIZE": "W", "LOC": (0, 1, 64, 25617, 1)},
-        {"IEC_TYPE": "BYTE",  "NAME": "__IB0_1_64_24578_1", "DIR": "I", "SIZE": "B", "LOC": (0, 1, 64, 24578, 1)},
-        {"IEC_TYPE": "UDINT", "NAME": "__ID0_1_64_25638_1", "DIR": "I", "SIZE": "D", "LOC": (0, 1, 64, 25638, 1)},
-        {"IEC_TYPE": "UDINT", "NAME": "__ID0_1_64_25638_2", "DIR": "I", "SIZE": "D", "LOC": (0, 1, 64, 25638, 2)},
-        {"IEC_TYPE": "UDINT", "NAME": "__ID0_1_64_25638_3", "DIR": "I", "SIZE": "D", "LOC": (0, 1, 64, 25638, 3)},
-        {"IEC_TYPE": "UDINT", "NAME": "__ID0_1_64_25638_4", "DIR": "I", "SIZE": "D", "LOC": (0, 1, 64, 25638, 4)},
-        {"IEC_TYPE": "UDINT", "NAME": "__ID0_1_4096_0",     "DIR": "I", "SIZE": "D", "LOC": (0, 1, 4096, 0)}
+        {"IEC_TYPE": "INT",   "NAME": "__QW0_1_64_25617_1", "DIR": "Q", "SIZE": "W", "LOC": (0, 1, 64, 25617, 1)},
+        {"IEC_TYPE": "UDINT", "NAME": "__ID0_1_4096_0",     "DIR": "I", "SIZE": "D", "LOC": (0, 1, 4096, 0)},
     ]
 
     # Generate MasterNode configuration

@@ -12,24 +12,49 @@ import os
 import hashlib
 from os.path import join
 
+from util.paths import ThirdPartyPath
+
+# How PLC code is bound to the runtime :
+#  - MONOLITHIC : PLC code is linked into the runtime binary
+#  - SPLIT      : IOs and logic go to two shared objects loaded separately,
+#                 so that logic can be hot-swapped
+#  - ABI        : PLC code is a standalone blob, calling back into the
+#                 runtime through the ABI structure (Zephyr split firmware)
+PLC_MONOLITHIC, PLC_SPLIT, PLC_ABI = range(3)
+
+
 class Builder:
     def __init__(self, CTRInstance):
         self.CTRInstance = CTRInstance
         self.buildpath = None
         self.SetBuildPath(self.CTRInstance._getBuildPath())
         self.md5key = None
+        self.logic_md5key = None
 
     bin_path = None
+    logic_bin_path = None
+
     def GetBinaryPath(self):
         return self.bin_path
+
+    def GetLogicBinaryPath(self):
+        return self.logic_bin_path
 
     def _GetMD5FileName(self):
         return join(self.buildpath, "lastbuildPLC.md5")
 
+    def _GetLogicMD5FileName(self):
+        return join(self.buildpath, "lastbuildLogic.md5")
+
     def ResetBinaryMD5(self):
         self.md5key = None
+        self.logic_md5key = None
         try:
             os.remove(self._GetMD5FileName())
+        except Exception:
+            pass
+        try:
+            os.remove(self._GetLogicMD5FileName())
         except Exception:
             pass
 
@@ -42,12 +67,24 @@ class Builder:
             except Exception:
                 return None
 
+    def GetLogicBinaryMD5(self):
+        if self.logic_md5key is not None:
+            return self.logic_md5key
+        else:
+            try:
+                return open(self._GetLogicMD5FileName(), "r").read()
+            except Exception:
+                return None
+
     def SetBuildPath(self, buildpath):
         if self.buildpath != buildpath:
             self.buildpath = buildpath
             self.bin = self.CTRInstance.GetProjectName() + self.extension
             self.bin_path = join(self.buildpath, self.bin)
+            self.logic_bin = self.CTRInstance.GetProjectName() + "_logic" + self.extension
+            self.logic_bin_path = join(self.buildpath, self.logic_bin)
             self.md5key = None
+            self.logic_md5key = None
             return True
         return False
 
@@ -72,17 +109,32 @@ class Builder:
     def getLoggingEnabled(self):
         return True
 
+    def getPLCBuildType(self):
+        return PLC_MONOLITHIC
+
     def getABIEnabled(self):
-        return False
+        return self.getPLCBuildType() == PLC_ABI
 
     def GetReservedIECChannels(self):
         return []
-    
+
+    def GetModuleSourceDir(self, name):
+        """Source directory of a third-party module for this target.
+
+        Default: the module is a sibling pre-built project under ThirdPartyPath.
+        Targets that fetch modules elsewhere override this.
+        """
+        return ThirdPartyPath(name)
+
+    def GetModuleBuildDir(self, name):
+        """Build directory of a third-party module (generated headers/libs).
+
+        Default: an out-of-tree "build" subdirectory of the module sources.
+        """
+        return join(self.GetModuleSourceDir(name), "build")
+
     def GetLibraries(self, ctr, typestack):
         return []
-
-    def GetPLCHeadersPreamble(self):
-        return '#include <stdio.h>\n'
 
     def Transfer(self, connector):
         self.CTRInstance.logger.write_error("Target doesn't support direct transfer/flashing !\n")

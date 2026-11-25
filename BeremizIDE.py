@@ -231,6 +231,7 @@ class LogPseudoFile(object):
 
 
 ID_FILEMENURECENTPROJECTS = wx.NewIdRef()
+ID_FILEMENUPLCTREE = wx.NewIdRef()
 
 
 class Beremiz(IDEFrame, LocalRuntimeMixin):
@@ -265,7 +266,7 @@ class Beremiz(IDEFrame, LocalRuntimeMixin):
                 if self.CTR is not None and not self.CheckSaveBeforeClosing():
                     return
 
-                self.OpenProject(projectpath)
+                self.OpenProject(projectpath, add_to_recent=False)
                 if not self.CTR.CheckProjectPathPerm():
                     self.ResetView()
 
@@ -275,6 +276,8 @@ class Beremiz(IDEFrame, LocalRuntimeMixin):
                    kind=wx.ITEM_NORMAL, text=_('Save') + '\tCTRL+S')
         AppendMenu(parent, help='', id=wx.ID_SAVEAS,
                    kind=wx.ITEM_NORMAL, text=_('Save as') + '\tCTRL+SHIFT+S')
+        AppendMenu(parent, help='', id=ID_FILEMENUPLCTREE,
+                   kind=wx.ITEM_CHECK, text=_('Store PLC as text files (plc/)'))
         AppendMenu(parent, help='', id=wx.ID_CLOSE,
                    kind=wx.ITEM_NORMAL, text=_('Close Tab') + '\tCTRL+W')
         AppendMenu(parent, help='', id=wx.ID_CLOSE_ALL,
@@ -294,6 +297,7 @@ class Beremiz(IDEFrame, LocalRuntimeMixin):
         self.Bind(wx.EVT_MENU, self.OnOpenProjectMenu, id=wx.ID_OPEN)
         self.Bind(wx.EVT_MENU, self.OnSaveProjectMenu, id=wx.ID_SAVE)
         self.Bind(wx.EVT_MENU, self.OnSaveProjectAsMenu, id=wx.ID_SAVEAS)
+        self.Bind(wx.EVT_MENU, self.OnPLCTreeMenu, id=ID_FILEMENUPLCTREE)
         self.Bind(wx.EVT_MENU, self.OnCloseTabMenu, id=wx.ID_CLOSE)
         self.Bind(wx.EVT_MENU, self.OnCloseProjectMenu, id=wx.ID_CLOSE_ALL)
         self.Bind(wx.EVT_MENU, self.OnPageSetupMenu, id=wx.ID_PAGE_SETUP)
@@ -668,6 +672,8 @@ class Beremiz(IDEFrame, LocalRuntimeMixin):
             MenuToolBar.EnableTool(wx.ID_SAVE, project_modified)
             self.FileMenu.Enable(wx.ID_SAVEAS, True)
             MenuToolBar.EnableTool(wx.ID_SAVEAS, True)
+            self.FileMenu.Enable(ID_FILEMENUPLCTREE, True)
+            self.FileMenu.Check(ID_FILEMENUPLCTREE, self.CTR.PLCTreeFormat)
             self.FileMenu.Enable(wx.ID_CLOSE_ALL, True)
         else:
             self.FileMenu.Enable(wx.ID_CLOSE, False)
@@ -679,6 +685,8 @@ class Beremiz(IDEFrame, LocalRuntimeMixin):
             MenuToolBar.EnableTool(wx.ID_SAVE, False)
             self.FileMenu.Enable(wx.ID_SAVEAS, False)
             MenuToolBar.EnableTool(wx.ID_SAVEAS, False)
+            self.FileMenu.Enable(ID_FILEMENUPLCTREE, False)
+            self.FileMenu.Check(ID_FILEMENUPLCTREE, False)
             self.FileMenu.Enable(wx.ID_CLOSE_ALL, False)
 
     def RefreshRecentProjectsMenu(self):
@@ -707,19 +715,22 @@ class Beremiz(IDEFrame, LocalRuntimeMixin):
         return OpenRecentProject
 
     def GenerateMenuRecursive(self, items, menu):
-        for kind, infos in items:
+        for kind, infos, *ref in items:
             if isinstance(kind, list):
-                text, id = infos
                 submenu = wx.Menu('')
                 self.GenerateMenuRecursive(kind, submenu)
-                menu.Append(id, text, submenu)
+                new_item = menu.AppendSubMenu(submenu, infos)
             elif kind == wx.ITEM_SEPARATOR:
                 menu.AppendSeparator()
+                continue
             else:
-                text, id, _help, callback = infos
-                AppendMenu(menu, help='', id=id, kind=kind, text=text)
+                text, help, callback = infos
+                new_item = AppendMenu(menu, help=help, id=wx.ID_ANY, kind=kind, text=text)
                 if callback is not None:
-                    self.Bind(wx.EVT_MENU, callback, id=id)
+                    self.Bind(wx.EVT_MENU, callback, new_item)
+            if ref:
+                store, name = ref
+                store[name] = new_item
 
     def RefreshEditorToolBar(self):
         IDEFrame.RefreshEditorToolBar(self)
@@ -769,7 +780,7 @@ class Beremiz(IDEFrame, LocalRuntimeMixin):
                     item = self.EditMenu.FindItemByPosition(self.EditMenuSize)
                     if item is not None:
                         if item.IsSeparator():
-                            self.EditMenu.RemoveItem(item)
+                            self.EditMenu.Remove(item)
                         else:
                             self.EditMenu.Delete(item.GetId())
                 self.LastPanelSelected = panel
@@ -787,7 +798,7 @@ class Beremiz(IDEFrame, LocalRuntimeMixin):
                 item = self.EditMenu.FindItemByPosition(i)
                 if item is not None:
                     if item.IsSeparator():
-                        self.EditMenu.RemoveItem(item)
+                        self.EditMenu.Remove(item)
                     else:
                         self.EditMenu.Delete(item.GetId())
             self.LastPanelSelected = None
@@ -904,7 +915,7 @@ class Beremiz(IDEFrame, LocalRuntimeMixin):
             self.OpenProject(dialog.GetPath())
         dialog.Destroy()
 
-    def OpenProject(self, projectpath):
+    def OpenProject(self, projectpath, add_to_recent=True):
         if os.path.isdir(projectpath):
             self.Config.Write("lastopenedfolder",
                               EncodeFileSystemPath(os.path.dirname(projectpath)))
@@ -930,7 +941,8 @@ class Beremiz(IDEFrame, LocalRuntimeMixin):
         else:
             self.ShowErrorMessage(_("\"%s\" folder is not a valid Beremiz project\n") % projectpath)
             err = True
-        self.RefreshConfigRecentProjects(projectpath, err)
+        if add_to_recent:
+            self.RefreshConfigRecentProjects(projectpath, err)
         self._Refresh(TITLE, EDITORTOOLBAR, FILEMENU, EDITMENU)
 
     def OnCloseProjectMenu(self, event):
@@ -943,6 +955,10 @@ class Beremiz(IDEFrame, LocalRuntimeMixin):
 
     def RefreshAfterLoad(self):
         self._Refresh(PROJECTTREE, POUINSTANCEVARIABLESPANEL, LIBRARYTREE)
+        if self.CTR is not None and not self.devmode:
+            view = self.CTR._OpenView()
+            if view is not None:
+                view.ShowProjectProperties()
 
     def RefreshAfterSave(self):
         self.RefreshAll()
@@ -966,6 +982,22 @@ class Beremiz(IDEFrame, LocalRuntimeMixin):
             self.CTR.SaveProjectAs()
             self.RefreshAfterSave()
             self.RefreshConfigRecentProjects(self.CTR.ProjectPath)
+
+    def OnPLCTreeMenu(self, event):
+        if self.CTR is not None:
+            tree_format = not self.CTR.PLCTreeFormat
+            if tree_format:
+                message = _("PLC program will be saved as IEC 61131-3 text files in plc"
+                            " directory, and plc.xml will be removed.\nContinue?")
+            else:
+                message = _("PLC program will be saved in plc.xml, and IEC 61131-3 text files"
+                            " of plc directory will be removed.\nContinue?")
+            dialog = wx.MessageDialog(self, message, _("PLC program storage"),
+                                      wx.YES_NO | wx.ICON_QUESTION)
+            if dialog.ShowModal() == wx.ID_YES:
+                self.CTR.SetPLCTreeFormat(tree_format)
+            dialog.Destroy()
+        self._Refresh(TITLE, FILEMENU)
 
     def OnQuitMenu(self, event):
         self.Close()

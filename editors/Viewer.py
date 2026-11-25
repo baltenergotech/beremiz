@@ -24,7 +24,6 @@
 
 
 from functools import cmp_to_key
-from operator import eq
 import math
 from time import time as gettime
 from threading import Lock
@@ -92,12 +91,32 @@ else:
         'other': 'new century schoolbook',
         'size':  10,
     }
+face_size_adjusted = False
+
 
 if wx.Platform == '__WXMSW__':
     MAX_ZOOMIN = 4
 else:
     MAX_ZOOMIN = 7
 ZOOM_FACTORS = [math.sqrt(2) ** x for x in range(-6, MAX_ZOOMIN)]
+
+
+def GetZoomFactor(scaling, level):
+    """Return the (x, y) zoom factors for the given grid scaling and zoom level.
+
+    When a grid is active, each factor of the base sqrt(2) progression is
+    snapped so the grid spacing maps to a whole number of pixels on each axis;
+    this keeps the tiled grid brush (whose tile size is rounded to whole pixels)
+    aligned with elements at every zoom level. Without a grid (scaling None),
+    the plain progression is used.
+    """
+    factor = ZOOM_FACTORS[level]
+    
+    # adjust only on zoom greater than 100% when no grid is displayed
+    if scaling is not None and factor > 1:
+        factor = max(int(scaling[0] * factor) / scaling[0],
+                     int(scaling[1] * factor) / scaling[1])
+    return (factor, factor)
 
 
 WX_NO_LOGICAL = "gtk3" in wx.PlatformInfo
@@ -236,9 +255,9 @@ def sort_blocks(block_infos1, block_infos2):
     x1, y1 = block_infos1[0].GetPosition()
     x2, y2 = block_infos2[0].GetPosition()
     if y1 == y2:
-        return eq(x1, x2)
+        return (x1 > x2) - (x1 < x2)
     else:
-        return eq(y1, y2)
+        return (y1 > y2) - (y1 < y2)
 
 # -------------------------------------------------------------------------------
 #                       Graphic elements Viewer base class
@@ -664,6 +683,7 @@ class Viewer(EditorPanel, DebugViewer):
 
     # Create a new Viewer
     def __init__(self, parent, tagname, window, controler, debug=False, instancepath=""):
+        global face, face_size_adjusted
         self.VARIABLE_PANEL_TYPE = controler.GetPouType(tagname.split("::")[1])
 
         EditorPanel.__init__(self, parent, tagname, window, controler, debug)
@@ -676,8 +696,7 @@ class Viewer(EditorPanel, DebugViewer):
         self.ResetView()
         self.LastClientSize = None
         self.Scaling = None
-        self.DrawGrid = True
-        self.GridBrush = wx.TRANSPARENT_BRUSH
+        self.GridBrush = None
         self.PageSize = None
         self.PagePen = wx.TRANSPARENT_PEN
         self.DrawingWire = False
@@ -719,13 +738,15 @@ class Viewer(EditorPanel, DebugViewer):
 
         dc = wx.ClientDC(self.Editor)
         while True:
-            font = wx.Font(faces["size"], wx.SWISS, wx.NORMAL, wx.NORMAL, faceName=faces["mono"])
+            font = wx.Font(wx.FontInfo(faces["size"]).FaceName(faces["mono"]))
+            # wx.Font(faces["size"], wx.SWISS, wx.NORMAL, wx.NORMAL, faceName=faces["mono"])
             dc.SetFont(font)
             width, _height = dc.GetTextExtent("ABCDEFGHIJKLMNOPQRSTUVWXYZ")
             # Arbitrary constant. Should become a user setting.
-            if width < 175:
+            if face_size_adjusted or width < 175:
                 break
-            faces["size"] -= 1
+            faces["size"] -= .1
+        face_size_adjusted = True
         self.Editor.SetFont(font)
         self.MiniTextDC = wx.MemoryDC(wx.Bitmap(1, 1))
         self.MiniTextDC.SetFont(wx.Font(round(faces["size"] * 0.75), wx.SWISS, wx.NORMAL, wx.NORMAL, faceName=faces["helv"]))
@@ -803,7 +824,7 @@ class Viewer(EditorPanel, DebugViewer):
             if refresh:
                 dc = self.GetLogicalDC()
             self.CurrentScale = new_scale
-            self.ViewScale = (ZOOM_FACTORS[self.CurrentScale], ZOOM_FACTORS[self.CurrentScale])
+            self.ViewScale = GetZoomFactor(self.Scaling, new_scale)
             if refresh:
                 self.Editor.Freeze()
                 if mouse_event is None:
@@ -927,13 +948,13 @@ class Viewer(EditorPanel, DebugViewer):
         wires = list(self.Wires.keys())
         comments = list(self.Comments.values())
         if sort_blocks:
-            blocks.sort(key=cmp_to_key(lambda x, y: eq(x.GetId(), y.GetId())))
+            blocks.sort(key=cmp_to_key(lambda x, y: (x.GetId() > y.GetId()) - (x.GetId() < y.GetId())))
         if sort_wires:
-            wires.sort(key=cmp_to_key(lambda x, y: eq(self.Wires[x],
-                                                      self.Wires[y])))
+            wires.sort(key=cmp_to_key(lambda x, y: (self.Wires[x] > self.Wires[y])
+                                                   - (self.Wires[x] < self.Wires[y])))
         if sort_comments:
-            comments.sort(key=cmp_to_key(lambda x, y: eq(x.GetId(),
-                                                         y.GetId())))
+            comments.sort(key=cmp_to_key(lambda x, y: (x.GetId() > y.GetId())
+                                                      - (x.GetId() < y.GetId())))
         return blocks + wires + comments
 
     def GetContinuationByName(self, name):
@@ -997,12 +1018,12 @@ class Viewer(EditorPanel, DebugViewer):
         elif isinstance(element, LD_Contact):
             iec_path = "%s.%s" % (instance_path, element.GetName())
         elif isinstance(element, SFC_Step):
-            iec_path = "%s.%s.X" % (instance_path, element.GetName())
+            iec_path = "%s.%s_X" % (instance_path, element.GetName())
         elif isinstance(element, SFC_Transition):
             connectors = element.GetConnectors()
             previous_steps = self.GetPreviousSteps(connectors["inputs"])
             next_steps = self.GetNextSteps(connectors["outputs"])
-            iec_path = "%s.%s->%s" % (instance_path, ",".join(previous_steps), ",".join(next_steps))
+            iec_path = "%s.%s_TO_%s" % (instance_path, "_".join(previous_steps), "_".join(next_steps))
         return iec_path
 
     def GetWireModifier(self, wire):
@@ -1123,23 +1144,26 @@ class Viewer(EditorPanel, DebugViewer):
     def RefreshScaling(self, refresh=True):
         properties = self.Controler.GetProjectProperties(self.Debug)
         scaling = properties["scaling"][self.CurrentLanguage]
-        if scaling[0] != 0 and scaling[1] != 0:
-            self.Scaling = scaling
-            if self.DrawGrid:
-                width = max(2, int(scaling[0] * self.ViewScale[0]))
-                height = max(2, int(scaling[1] * self.ViewScale[1]))
-                bitmap = wx.Bitmap(width, height)
-                dc = wx.MemoryDC(bitmap)
-                dc.SetBackground(wx.Brush(self.Editor.GetBackgroundColour()))
-                dc.Clear()
-                dc.SetPen(MiterPen(wx.Colour(180, 180, 180)))
-                dc.DrawPoint(0, 0)
-                self.GridBrush = wx.Brush(bitmap)
-            else:
-                self.GridBrush = wx.TRANSPARENT_BRUSH
+        self.Scaling = scaling if scaling[0]>0 and scaling[1]>0 else None
+        # filling rectangle with downscaled brush seems to be 
+        # extremely CPU hungry (at least on gtk)
+        # so we don't display grid on zoom smaller than 100%
+        if self.Scaling and self.ViewScale[0] >= 1 and self.ViewScale[1] >= 1:
+            width, height = scaling
+            if wx.Platform == '__WXMSW__':
+                # bug on windows brush filled rectangle ignore DC scale
+                # so brush is extended according to scale
+                width *= self.ViewScale[0]
+                height *= self.ViewScale[1]
+            bitmap = wx.Bitmap(int(width), int(height))
+            dc = wx.MemoryDC(bitmap)
+            dc.SetBackground(wx.Brush(self.Editor.GetBackgroundColour()))
+            dc.Clear()
+            dc.SetPen(MiterPen(wx.Colour(180, 180, 180)))
+            dc.DrawPoint(0, 0)
+            self.GridBrush = wx.Brush(bitmap)
         else:
-            self.Scaling = None
-            self.GridBrush = wx.TRANSPARENT_BRUSH
+            self.GridBrush = None
         page_size = properties["pageSize"]
         if page_size != (0, 0):
             self.PageSize = list(map(int, page_size))
@@ -3690,7 +3714,7 @@ class Viewer(EditorPanel, DebugViewer):
         else:
             dc.SetBackground(wx.Brush(self.Editor.GetBackgroundColour()))
             dc.Clear()
-        if self.Scaling is not None and self.DrawGrid and not printing:
+        if self.GridBrush is not None and not printing:
             dc.SetPen(wx.TRANSPARENT_PEN)
             dc.SetBrush(self.GridBrush)
             xstart, ystart = self.GetViewStart()

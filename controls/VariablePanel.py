@@ -184,6 +184,8 @@ class VariableTable(CustomTable):
 
         Otherwise default to the default renderer.
         """
+        default_colours = (grid.GetDefaultCellBackgroundColour(),
+                           grid.GetDefaultCellTextColour())
         for row in range(self.GetNumberRows()):
             var_class = self.GetValueByName(row, "Class")
             var_type = self.GetValueByName(row, "Type")
@@ -243,11 +245,12 @@ class VariableTable(CustomTable):
                 grid.SetCellRenderer(row, col, renderer)
 
                 if colname == "Location" and LOCATION_MODEL.match(self.GetValueByName(row, colname)) is None:
-                    highlight_colours = ERROR_HIGHLIGHT
+                    background, foreground = ERROR_HIGHLIGHT(*default_colours)
                 else:
-                    highlight_colours = row_highlights.get(colname.lower(), [(wx.WHITE, wx.BLACK)])[-1]
-                grid.SetCellBackgroundColour(row, col, highlight_colours[0])
-                grid.SetCellTextColour(row, col, highlight_colours[1])
+                    background, foreground = self.GetHighlightColours(
+                        row_highlights, colname, default_colours)
+                grid.SetCellBackgroundColour(row, col, background)
+                grid.SetCellTextColour(row, col, foreground)
             self.ResizeRow(grid, row)
 
 
@@ -491,7 +494,7 @@ class VariablePanel(wx.Panel):
         controls_sizer.Add(self.ClassFilter)
 
         for name, bitmap, help in [
-                ("AddButton", "add_element", _("Add variable")),
+                ("AddButton", "add_element", _("Add variable (Ctrl+ to copy)")),
                 ("DeleteButton", "remove_element", _("Remove variable")),
                 ("UpButton", "up", _("Move variable up")),
                 ("DownButton", "down", _("Move variable down"))]:
@@ -602,7 +605,8 @@ class VariablePanel(wx.Panel):
 
         def _AddVariable(new_row):
             row_content = self.DefaultValue.copy()
-            if new_row > 0:
+            if new_row > 0 and wx.GetKeyState(wx.WXK_CONTROL):
+                # Ctrl+Add: copy type/description/location from the selected variable
                 # doesn't copy values of previous var if it's non-editable (like a FB)
                 if self.Values[new_row-1].Edit:
                     row_content = self.Values[new_row-1].copy()
@@ -617,6 +621,10 @@ class VariablePanel(wx.Panel):
                     prefix = model.match(old_location).group(0)
                     addr = int(re.split(model, old_location)[-1]) + 1
                     row_content.Location = prefix + str(addr)
+            else:
+                # default behaviour: a fresh variable with a unique default name
+                row_content.Name = self.Controler.GenerateNewName(
+                    self.TagName, row_content.Name, row_content.Name+'%d')
 
             if not row_content.Class:
                 row_content.Class = self.DefaultTypes.get(self.Filter, self.Filter)

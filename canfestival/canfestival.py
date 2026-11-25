@@ -1,61 +1,135 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 
-# This file is part of Beremiz, a Integrated Development Environment for
-# programming IEC 61131-3 automates supporting plcopen standard and CanFestival.
-#
-# Copyright (C) 2007: Edouard TISSERANT and Laurent BESSARD
+# Copyright (C) 2007: Laurent BESSARD
 # Copyright (C) 2017: Andrey Skvortsov
+# Copyright (C) 2007-2026: Edouard TISSERANT
 #
 # See COPYING file for copyrights details.
-#
-# This program is free software; you can redistribute it and/or
-# modify it under the terms of the GNU General Public License
-# as published by the Free Software Foundation; either version 2
-# of the License, or (at your option) any later version.
-#
-# This program is distributed in the hope that it will be useful,
-# but WITHOUT ANY WARRANTY; without even the implied warranty of
-# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-# GNU General Public License for more details.
-#
-# You should have received a copy of the GNU General Public License
-# along with this program; if not, write to the Free Software
-# Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301, USA.
-
 
 
 import os
 import sys
 import shutil
 import wx
-from gnosis.xml.pickle import *  # pylint: disable=import-error
-from gnosis.xml.pickle.util import setParanoia  # pylint: disable=import-error
 
 import util.paths as paths
 
 from util.TranslationCatalogs import AddCatalog
 from ConfigTreeNode import ConfigTreeNode
 from plcopen.types_enums import LOCATION_CONFNODE, LOCATION_VAR_MEMORY
+from POULibrary import POULibrary
 
-CanFestivalPath = paths.ThirdPartyPath("CanFestival-3")  # noqa
-sys.path.append(os.path.join(CanFestivalPath, "objdictgen"))  # noqa
+ObjDictGenPath = paths.ThirdPartyPath("canfestival", "objdictgen")  # noqa
+sys.path.append(ObjDictGenPath)  # noqa
 
 # pylint: disable=wrong-import-position
 from nodelist import NodeList
 from nodemanager import NodeManager
 import gen_cfile
 import eds_utils
-import canfestival_config as local_canfestival_config  # pylint: disable=import-error
 from commondialogs import CreateNodeDialog
 from subindextable import IECTypeConversion, SizeConversion
 from canfestival import config_utils
 from canfestival.SlaveEditor import SlaveEditor, MasterViewer
 from canfestival.NetworkEditor import NetworkEditor
 
+# CiA402 axes need the Motion Control Library, which is an optional extension
+try:
+    from canfestival.CanOpenCIA402Node import _CanOpenCIA402NodeCTN
+    HAS_MCL = True
+except Exception:
+    HAS_MCL = False
 
-AddCatalog(os.path.join(CanFestivalPath, "objdictgen", "locale"))
-setParanoia(0)
+
+AddCatalog(os.path.join(ObjDictGenPath, "locale"))
+
+# --------------------------------------------------
+#            CanFestival build configuration
+# --------------------------------------------------
+# Where CanFestival lives, and how the generated OD/runtime C is compiled and
+# linked against it, depend on the *selected build target* - so none of this can
+# be a module-level global (the target is unknown at import time). Everything
+# below is resolved per build, from the current ConfigTreeNode root (ctroot).
+# The module source/build directories come from the target builder's
+# GetModuleSourceDir()/GetModuleBuildDir(), so this file stays target-agnostic.
+#
+#  - Local Python runtime (Linux/Win/OSX): CanFestival is a sibling pre-built
+#    CMake project under ThirdPartyPath. Its static libs are linked into the PLC
+#    shared object (build position-independent):
+#       mkdir build && cd build
+#       cmake .. -DCF_TARGET=unix -DCF_CAN_DRIVER="virtual;socket" \
+#                -DCMAKE_POSITION_INDEPENDENT_CODE=ON
+#       make
+
+def GetCanFestivalPath(ctroot):
+    """Root of the CanFestival sources for the current build target."""
+    return ctroot.GetBuilder().GetModuleSourceDir("canfestival")
+
+
+def GetCanFestivalBuildPath(ctroot):
+    """Directory holding CanFestival's generated config.h / built libs."""
+    return ctroot.GetBuilder().GetModuleBuildDir("canfestival")
+
+
+def _ReadCMakeCache(ctroot):
+    """Parse CanFestival's CMakeCache.txt as {key: value}.
+
+    Only meaningful for the local Python runtime build; returns {} when the
+    cache is missing (e.g. CanFestival not built yet).
+    """
+    cache = {}
+    cache_path = os.path.join(GetCanFestivalBuildPath(ctroot), "CMakeCache.txt")
+    if os.path.isfile(cache_path):
+        with open(cache_path) as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith(("#", "//")):
+                    continue
+                # Format: KEY:TYPE=VALUE
+                key, sep, rest = line.partition(":")
+                if not sep:
+                    continue
+                _, sep, value = rest.partition("=")
+                if sep:
+                    cache[key.strip()] = value.strip()
+    return cache
+
+
+# Target/timer/CAN driver that CanFestival was actually built with, read from
+# the sibling CMake cache. Defaults match CMakeLists.txt when the cache isn't
+# available yet. Only meaningful for the local Python runtime build.
+def GetCanFestivalTarget(ctroot):
+    return _ReadCMakeCache(ctroot).get("CF_TARGET", "unix")
+
+
+def GetDLLList(ctroot):
+    # CF_CAN_DRIVER may list several drivers (CMake stores lists semicolon-
+    # separated, e.g. "virtual;socket"); CanFestival builds one shared driver
+    # library per entry. The CAN_Driver dropdown offers every built driver;
+    # rebuild CanFestival with a different -DCF_CAN_DRIVER list to change them.
+    drivers = _ReadCMakeCache(ctroot).get("CF_CAN_DRIVER", "virtual").split(";")
+    return ["can_%s" % drv for drv in drivers if drv]
+
+
+def getCFLAGS(ctroot):
+    """Include flags to compile generated OD/runtime C against CanFestival."""
+    include = os.path.join(GetCanFestivalPath(ctroot), "include")
+    return ' -I"%s" -I"%s" -I"%s" -I"%s"' % (
+        include,
+        os.path.join(include, GetCanFestivalTarget(ctroot)),
+        paths.AbsNeighbourFile(__file__, GetCanFestivalTarget(ctroot)),
+        # CMake writes the generated config.h into the build tree.
+        os.path.join(GetCanFestivalBuildPath(ctroot), "include"))
+
+
+def getLDFLAGS(ctroot):
+    """Static libraries (CMake build outputs) to link into the PLC."""
+    build = GetCanFestivalBuildPath(ctroot)
+    return ' "%s" "%s"' % (
+        os.path.join(build, "src", "libcanfestival.a"),
+        os.path.join(build, "drivers",
+                     "libcanfestival_%s.a" % GetCanFestivalTarget(ctroot)))
 
 
 # --------------------------------------------------
@@ -63,8 +137,44 @@ setParanoia(0)
 # --------------------------------------------------
 
 
-def GetSlaveLocationTree(slave_node, current_location, name):
+def GetSlaveLocationTree(slave_node, current_location, name, controller=False):
     entries = []
+    # When this node owns a local CAN controller (a CanOpen master or a
+    # standalone slave, not a remote slave managed by a master), expose its
+    # controller state and bus error counters as diagnostic located variables,
+    # using CANopen index 0 (never a valid PDO mapping) as the sub-location so
+    # they don't collide with mapped process data. Mirrors how the Modbus
+    # plugin exposes per-request status bytes at .0.0/.0.1/.0.2.
+    if controller:
+        locstr = ".".join(map(str, current_location))
+        entries.append({
+            "name": "CAN controller state",
+            "type": LOCATION_VAR_MEMORY,
+            "size": 8,
+            "IEC_type": "BYTE",
+            "var_name": "can_state",
+            "location": "B" + locstr + ".0.0",
+            "description": "CAN controller state (0 -> Error-active, 1 -> Error-warning, "
+                           "2 -> Error-passive, 3 -> Bus-off, 4 -> Stopped). ",
+            "children": []})
+        entries.append({
+            "name": "CAN TX error counter",
+            "type": LOCATION_VAR_MEMORY,
+            "size": 8,
+            "IEC_type": "BYTE",
+            "var_name": "can_tx_errors",
+            "location": "B" + locstr + ".0.1",
+            "description": "CAN controller transmit error counter. ",
+            "children": []})
+        entries.append({
+            "name": "CAN RX error counter",
+            "type": LOCATION_VAR_MEMORY,
+            "size": 8,
+            "IEC_type": "BYTE",
+            "var_name": "can_rx_errors",
+            "location": "B" + locstr + ".0.2",
+            "description": "CAN controller receive error counter. ",
+            "children": []})
     for index, subindex, size, entry_name in slave_node.GetMapVariableList():
         subentry_infos = slave_node.GetSubentryInfos(index, subindex)
         typeinfos = slave_node.GetEntryInfos(subentry_infos["type"])
@@ -94,8 +204,8 @@ class _SlaveCTN(NodeManager):
     <xsd:schema xmlns:xsd="http://www.w3.org/2001/XMLSchema">
       <xsd:element name="CanFestivalSlaveNode">
         <xsd:complexType>
-          <xsd:attribute name="CAN_Device" type="xsd:string" use="optional"/>
-          <xsd:attribute name="CAN_Baudrate" type="xsd:string" use="optional"/>
+          <xsd:attribute name="CAN_Device" type="xsd:string" use="optional" default="0"/>
+          <xsd:attribute name="CAN_Baudrate" type="xsd:string" use="optional" default="125K"/>
           <xsd:attribute name="NodeId" type="xsd:integer" use="optional" default="2"/>
           <xsd:attribute name="Sync_Align" type="xsd:integer" use="optional" default="0"/>
           <xsd:attribute name="Sync_Align_Ratio" use="optional" default="50">
@@ -112,7 +222,7 @@ class _SlaveCTN(NodeManager):
     """
 
     EditorType = SlaveEditor
-    IconPath = os.path.join(CanFestivalPath, "objdictgen", "networkedit.png")
+    IconPath = os.path.join(ObjDictGenPath, "networkedit.png")
 
     def __init__(self):
         # TODO change netname when name change
@@ -154,7 +264,7 @@ class _SlaveCTN(NodeManager):
         return self.CTNName()
 
     def GetSlaveODPath(self):
-        return os.path.join(self.CTNPath(), 'slave.od')
+        return os.path.join(self.CTNPath(), 'slave.dcf')
 
     def GetCanDevice(self):
         return self.CanFestivalSlaveNode.getCAN_Device()
@@ -171,7 +281,7 @@ class _SlaveCTN(NodeManager):
                                os.path.expanduser("~"),
                                "%s.eds" % self.CTNName(),
                                _("EDS files (*.eds)|*.eds|All files|*.*"),
-                               wx.SAVE | wx.OVERWRITE_PROMPT)
+                               wx.FD_SAVE | wx.FD_OVERWRITE_PROMPT)
         if dialog.ShowModal() == wx.ID_OK:
             result = eds_utils.GenerateEDSFile(dialog.GetPath(), self.GetCurrentNodeCopy())
             if result:
@@ -205,7 +315,8 @@ class _SlaveCTN(NodeManager):
     def GetVariableLocationTree(self):
         return GetSlaveLocationTree(self.CurrentNode,
                                     self.GetCurrentLocation(),
-                                    self.BaseParams.getName())
+                                    self.BaseParams.getName(),
+                                    controller=True)
 
     def CTNGenerate_C(self, buildpath, locations):
         """
@@ -235,7 +346,7 @@ class _SlaveCTN(NodeManager):
         res = eds_utils.GenerateEDSFile(os.path.join(buildpath, "Slave_%s.eds" % prefix), slave)
         if res:
             raise Exception(res)
-        return [(Gen_OD_path, local_canfestival_config.getCFLAGS(CanFestivalPath))], "", False
+        return [(Gen_OD_path, getCFLAGS(self.GetCTRoot()))], "", False
 
     def LoadPrevious(self):
         self.LoadCurrentPrevious()
@@ -300,8 +411,8 @@ class _NodeListCTN(NodeList):
     <xsd:schema xmlns:xsd="http://www.w3.org/2001/XMLSchema">
       <xsd:element name="CanFestivalNode">
         <xsd:complexType>
-          <xsd:attribute name="CAN_Device" type="xsd:string" use="optional"/>
-          <xsd:attribute name="CAN_Baudrate" type="xsd:string" use="optional"/>
+          <xsd:attribute name="CAN_Device" type="xsd:string" use="optional" default="0"/>
+          <xsd:attribute name="CAN_Baudrate" type="xsd:string" use="optional" default="125K"/>
           <xsd:attribute name="NodeId" type="xsd:integer" use="optional" default="1"/>
           <xsd:attribute name="Sync_TPDOs" type="xsd:boolean" use="optional" default="true"/>
         </xsd:complexType>
@@ -310,13 +421,34 @@ class _NodeListCTN(NodeList):
     """
 
     EditorType = NetworkEditor
-    IconPath = os.path.join(CanFestivalPath, "objdictgen", "networkedit.png")
+    IconPath = os.path.join(ObjDictGenPath, "networkedit.png")
+
+    CTNChildrenTypes = []
+    if HAS_MCL:
+        CTNChildrenTypes.append(
+            ("CanOpenCIA402Node", _CanOpenCIA402NodeCTN, "CANopen CiA402 axis"))
 
     def __init__(self):
         manager = _NodeManager(self)
         NodeList.__init__(self, manager)
         self.LoadProject(self.CTNPath())
         self.SetNetworkName(self.BaseParams.getName())
+
+    def GetCIA402Children(self):
+        """
+        CiA402 axes of this network, by CANopen node ID.
+        """
+        return {child.GetNodeId(): child
+                for child in self.IECSortedChildren()
+                if isinstance(child, _CanOpenCIA402NodeCTN)} if HAS_MCL else {}
+
+    def CheckChildCompatible(self, child):
+        nodeid = child.GetNodeId()
+        if nodeid not in self.SlaveNodes:
+            self.GetCTRoot().logger.write_warning(
+                _("Warning: CiA402 axis \"%s\" refers to CANopen node %d, "
+                  "which is not part of network \"%s\"\n")
+                % (child.CTNName(), nodeid, self.BaseParams.getName()))
 
     def GetCanDevice(self):
         return self.CanFestivalNode.getCAN_Device()
@@ -352,13 +484,20 @@ class _NodeListCTN(NodeList):
         current_location = self.GetCurrentLocation()
         nodeindexes = list(self.SlaveNodes.keys())
         nodeindexes.sort()
+        cia402_children = self.GetCIA402Children()
         children = []
         children += [GetSlaveLocationTree(self.Manager.GetCurrentNodeCopy(),
                                           current_location,
-                                          _("Local entries"))]
+                                          _("Local entries"),
+                                          controller=True)]
+        # a node driven as a CiA402 axis is published by the axis itself, along
+        # with its network position and axis reference
         children += [GetSlaveLocationTree(self.SlaveNodes[nodeid]["Node"],
                                           current_location + (nodeid,),
-                                          self.SlaveNodes[nodeid]["Name"]) for nodeid in nodeindexes]
+                                          self.SlaveNodes[nodeid]["Name"])
+                     for nodeid in nodeindexes if nodeid not in cia402_children]
+        children += [child.GetVariableLocationTree()
+                     for _nodeid, child in sorted(cia402_children.items())]
 
         return {
             "name":     self.BaseParams.getName(),
@@ -382,7 +521,7 @@ class _NodeListCTN(NodeList):
                     self.GetCTRoot().logger.write_error(_("Error: No PLC built\n"))
                     return
 
-                masterpath = os.path.join(buildpath, "MasterGenerated.od")
+                masterpath = os.path.join(buildpath, "MasterGenerated.dcf")
                 if not os.path.exists(masterpath):
                     self.GetCTRoot().logger.write_error(_("Error: No Master generated\n"))
                     return
@@ -447,23 +586,34 @@ class _NodeListCTN(NodeList):
         # define a unique name for the generated C file
         prefix = "_".join(map(str, current_location))
         Gen_OD_path = os.path.join(buildpath, "OD_%s.c" % prefix)
+
+        # A CiA402 axis needs its profile objects mapped whether the program
+        # uses them or not, so ask the axes before computing the mapping. Their
+        # locations are built the same way the located variables of the program
+        # are, and duplicates are harmless, so both can simply be concatenated.
+        locations = list(locations)
+        known = {location["NAME"] for location in locations}
+        for _nodeid, child in sorted(self.GetCIA402Children().items()):
+            locations.extend([location
+                              for location in child.GetCIA402MasterLocations()
+                              if location["NAME"] not in known])
+
         # Create a new copy of the model with DCF loaded with PDO mappings for desired location
         try:
             master, pointers = config_utils.GenerateConciseDCF(locations, current_location, self, self.CanFestivalNode.getSync_TPDOs(), "OD_%s" % prefix)
         except config_utils.PDOmappingException as e:
-            raise Exception(e.message)
+            raise Exception(str(e))
         # Do generate C file.
         res = gen_cfile.GenerateFile(Gen_OD_path, master, pointers)
         if res:
             raise Exception(res)
 
-        file = open(os.path.join(buildpath, "MasterGenerated.od"), "w")
-        # linter disabled here, undefined variable happens
-        # here because gnosis isn't impored while linting
-        dump(master, file)  # pylint: disable=undefined-variable
-        file.close()
+        # Save the generated master OD so it can be inspected (Show Master).
+        res = eds_utils.SaveNodeAsDCF(os.path.join(buildpath, "MasterGenerated.dcf"), master)
+        if res:
+            raise Exception(res)
 
-        return [(Gen_OD_path, local_canfestival_config.getCFLAGS(CanFestivalPath))], "", False
+        return [(Gen_OD_path, getCFLAGS(self.GetCTRoot()))], "", False
 
     def LoadPrevious(self):
         self.Manager.LoadCurrentPrevious()
@@ -495,7 +645,7 @@ class RootClass(object):
             if element["name"] == "CanFestivalInstance":
                 for child in element["children"]:
                     if child["name"] == "CAN_Driver":
-                        child["type"] = local_canfestival_config.DLL_LIST
+                        child["type"] = GetDLLList(self.GetCTRoot())
         return infos
 
     def GetCanDriver(self):
@@ -505,15 +655,27 @@ class RootClass(object):
         return res
 
     def CTNGenerate_C(self, buildpath, locations):
-        can_driver = self.GetCanDriver()
-        if can_driver is not None:
-            can_drivers = local_canfestival_config.DLL_LIST
+        can_drivers = GetDLLList(self.GetCTRoot())
+        if can_drivers:
+            can_driver = self.GetCanDriver()
+            # If the project doesn't explicitly select a driver, or selects one
+            # that wasn't built, fall back to the (only) driver CanFestival was
+            # built with. Matches the historical behaviour.
             if can_driver not in can_drivers:
+                if can_driver:
+                    self.GetCTRoot().logger.write_warning(
+                    _("Warning: %s CAN driver not found in %s; rebuild CanFestival "
+                      "with -DCF_CAN_DRIVER=<name>\n") % (can_driver, GetCanFestivalBuildPath(self.GetCTRoot())))
                 can_driver = can_drivers[0]
             can_drv_ext = self.GetCTRoot().GetBuilder().extension
             can_drv_prefix = self.GetCTRoot().GetBuilder().dlopen_prefix
-            can_driver_name = can_drv_prefix + "libcanfestival_" + can_driver + can_drv_ext
+            # File name as built by CMake (drivers/libcanfestival_can_<drv>.so)
+            can_driver_filename = "libcanfestival_" + can_driver + can_drv_ext
+            # Name used to dlopen the driver from the PLC working directory
+            can_driver_name = can_drv_prefix + can_driver_filename
         else:
+            can_driver = None
+            can_driver_filename = ""
             can_driver_name = ""
 
         format_dict = {
@@ -521,12 +683,15 @@ class RootClass(object):
             "candriver": can_driver_name,
             "nodes_includes": "",
             "board_decls": "",
+            "nodes_register": "",
             "nodes_init": "",
             "nodes_open": "",
             "nodes_stop": "",
             "nodes_close": "",
             "nodes_send_sync": "",
             "nodes_proceed_sync": "",
+            "canstate_decls": "",
+            "nodes_read_can_state": "",
             "slavebootups": "",
             "slavebootup_register": "",
             "post_sync": "",
@@ -566,9 +731,9 @@ class RootClass(object):
                 format_dict["slavebootup_register"] += (
                     "%s_Data.post_SlaveBootup = %s_post_SlaveBootup;\n" % (nodename, nodename))
                 format_dict["pre_op"] += (
-                    "static void %s_preOperational(CO_Data* d){\n    " % (nodename) +
-                    "".join(["    masterSendNMTstateChange(d, %d, NMT_Reset_Comunication);\n" % NdId for NdId in SlaveIDs]) +
-                    "}\n")
+                    "static void %s_preOperational(CO_Data* d){\n" % (nodename) +
+                    "\n".join(["    masterSendNMTstateChange(d, %d, NMT_Reset_Comunication);" % NdId for NdId in SlaveIDs]) +
+                    "\n}\n")
                 format_dict["pre_op_register"] += (
                     "%s_Data.preOperational = %s_preOperational;\n" % (nodename, nodename))
             else:
@@ -599,22 +764,81 @@ class RootClass(object):
                 nodename,
                 child.GetCanDevice(),
                 child_data.getCAN_Baudrate())
+            # Let the SDO client function blocks address this network by the
+            # IEC channel of its confnode
+            format_dict["nodes_register"] += '__CanOpen_RegisterNetwork(%d, &%s_Data);\n    ' % (
+                child.BaseParams.getIEC_Channel(),
+                nodename)
             format_dict["nodes_open"] += 'NODE_OPEN(%s)\n    ' % (nodename)
             format_dict["nodes_close"] += 'NODE_CLOSE(%s)\n    ' % (nodename)
             format_dict["nodes_stop"] += 'NODE_STOP(%s)\n    ' % (nodename)
 
-        filename = paths.AbsNeighbourFile(__file__, "cf_runtime.c")
-        cf_main = open(filename).read() % format_dict
-        cf_main_path = os.path.join(buildpath, "CF_%(locstr)s.c" % format_dict)
-        f = open(cf_main_path, 'w')
-        f.write(cf_main)
-        f.close()
+            # Per-node CAN controller diagnostic located variables (state /
+            # tx err / rx err), exposed by GetSlaveLocationTree at CANopen
+            # index 0, sub 0/1/2 under this node's location. They are not OD
+            # entries: declare their storage and the PLC located-variable
+            # pointers here, and (on Zephyr) refresh them each cycle from the
+            # CAN driver in __retrieve_.
+            childloc = child.GetCurrentLocation()
+            canstate_fields = {0: "can_state", 1: "can_txerr", 2: "can_rxerr"}
+            canstate_vars = {}
+            for loc in locations:
+                L = loc["LOC"]
+                if (L[:len(childloc)] == childloc
+                        and len(L) == len(childloc) + 2
+                        and L[len(childloc)] == 0
+                        and L[len(childloc) + 1] in canstate_fields):
+                    canstate_vars[L[len(childloc) + 1]] = loc["NAME"]
+            if canstate_vars:
+                format_dict["canstate_decls"] += (
+                    "static UNS8 %s_can_state, %s_can_txerr, %s_can_rxerr;\n" % (
+                        nodename, nodename, nodename))
+                for sub, field in sorted(canstate_fields.items()):
+                    if sub in canstate_vars:
+                        format_dict["canstate_decls"] += "UNS8 *%s = &%s_%s;\n" % (
+                            canstate_vars[sub], nodename, field)
+                format_dict["nodes_read_can_state"] += 'NODE_READ_CAN_STATE(%s)\n    ' % (nodename)
 
-        res = [(cf_main_path, local_canfestival_config.getCFLAGS(CanFestivalPath))], local_canfestival_config.getLDFLAGS(CanFestivalPath), True
+        filename = paths.AbsNeighbourFile(__file__, "cf_runtime.c")
+        with open(filename) as cf_template:
+            cf_main = cf_template.read() % format_dict
+        cf_main_path = os.path.join(buildpath, "CF_%(locstr)s.c" % format_dict)
+        with open(cf_main_path, 'w') as f:
+            f.write(cf_main)
+
+        res = [(cf_main_path, getCFLAGS(self.GetCTRoot()))], getLDFLAGS(self.GetCTRoot()), True
 
         if can_driver is not None:
-            can_driver_path = os.path.join(CanFestivalPath, "drivers", can_driver, can_driver_name)
+            # The CAN driver shared library is a CMake build output.
+            can_driver_path = os.path.join(GetCanFestivalBuildPath(self.GetCTRoot()), "drivers", can_driver_filename)
             if os.path.exists(can_driver_path):
                 res += ((can_driver_name, open(can_driver_path, "rb")),)
+            else:
+                self.GetCTRoot().logger.write_warning(
+                    _("Warning: CAN driver %s not found, please build CanFestival "
+                      "with -DCF_CAN_DRIVER=%s\n") % (can_driver_path, can_driver[4:]))
 
         return res
+
+class CanFestival_Lib(POULibrary):
+    """
+    SDO client function blocks, and the CiA402 torque limit blocks built on top
+    of them.
+    TODO: complete the POUs and types according to CiA 405 and CiA 314
+    """
+
+    def GetLibraryPath(self):
+        return paths.AbsNeighbourFile(__file__, "pous.xml")
+
+    def Generate_C(self, buildpath, varlist, IECCFLAGS):
+        ctroot = self.GetCTR()
+        cf_sdo_path = paths.AbsNeighbourFile(__file__, "cf_sdo.c")
+        gen_cf_sdo_path = os.path.join(buildpath, "cf_sdo.c")
+        with open(cf_sdo_path) as cf_sdo_file:
+            cf_sdo_code = cf_sdo_file.read()
+        with open(gen_cf_sdo_path, 'w') as gen_cf_sdo_file:
+            gen_cf_sdo_file.write(cf_sdo_code)
+
+        return ((["cf_sdo"],
+                 [(gen_cf_sdo_path, IECCFLAGS + getCFLAGS(ctroot))],
+                 False), "")
