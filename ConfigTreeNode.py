@@ -690,12 +690,9 @@ class ConfigTreeNode(object):
             child.ClearChildren()
         self.Children = {}
 
-<<<<<<< HEAD
     LoadErrorImpliesUserCheck = \
         _("Note: loading errors are expected when opening projects written for different targets. Check config.\n")
 
-=======
->>>>>>> origin/HEAD
     def LoadXMLParams(self, CTNName=None):
         methode_name = os.path.join(self.CTNPath(CTNName), "methods.py")
         if os.path.isfile(methode_name):
