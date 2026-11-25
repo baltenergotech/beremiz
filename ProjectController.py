@@ -1180,7 +1180,7 @@ class ProjectController(ConfigTreeNode, PLCControler):
 
             # copy python_desc_template.pycpp into POUS.pycpp
             shutil.copyfile(python_desc_template_pycpp_path, pous_pycpp_path)
-            
+
             buildcmd = f"cpp -P -I \"{matiec_c_lib}\" \"{pous_pycpp_path}\" -o \"{pous_py_path}\""
 
             # Invoke C pre-processor to generate POUS.py
@@ -1194,7 +1194,7 @@ class ProjectController(ConfigTreeNode, PLCControler):
                 self.logger.write_error(result + "\n")
                 self.logger.write_error(err_result + "\n")
                 return False
-            
+
             try:
                 from targets.var_access import POUSData, TypeClass
                 pous_module = {"TypeClass": targets.var_access.TypeClass}
@@ -1421,13 +1421,8 @@ class ProjectController(ConfigTreeNode, PLCControler):
                     requirements[0] if requirements else None)
                    for loc, _Cfiles, DoCalls, *requirements in
                    self.LocationCFilesAndCFLAGS if loc and DoCalls==True]
-<<<<<<< HEAD
 
         plc_main_fields = {
-=======
-        
-        return {
->>>>>>> origin/HEAD
             "calls_prototypes": "\n".join([
                 "\n".join([
                     f"int __init_{locstr}(int argc,void **argv);",
@@ -1456,25 +1451,7 @@ class ProjectController(ConfigTreeNode, PLCControler):
                     req['current_version'],
                     req['minimum_version'])
                 if req else "EXT_NO_REQUIREMENT"
-<<<<<<< HEAD
                 for _locstr, req in locreqs])
-=======
-                for _locstr, req in locreqs]),
-            # Optional per-extension logic lifecycle hooks (weakly linked): an extension
-            # implements __logic_bound_<loc>/__logic_active_<loc> only if it keeps state
-            # tied to the logic .so and must react to (re)loads and hot-swaps.
-            "logic_hook_prototypes": "\n".join([
-                "\n".join([
-                    f"extern void __logic_bound_{locstr}(void *handle) __attribute__((weak));",
-                    f"extern void __logic_active_{locstr}(void) __attribute__((weak));"])
-                for locstr, _req in locreqs]),
-            "logic_bound_calls": "\n    ".join([
-                f"if(__logic_bound_{locstr}) __logic_bound_{locstr}(handle);"
-                for locstr, _req in locreqs]),
-            "logic_active_calls": "\n    ".join([
-                f"if(__logic_active_{locstr}) __logic_active_{locstr}();"
-                for locstr, _req in locreqs])
->>>>>>> origin/HEAD
 
         } if not self.BeremizRoot.getDisable_Extensions() else {
 
@@ -2538,7 +2515,7 @@ class ProjectController(ConfigTreeNode, PLCControler):
 
         # Compare PLC project with PLC on target
         same_md5 = self._connector.MatchMD5(IOs_MD5)
-        
+
         if self.IsPLCStarted():
             if not(same_md5) or not(split):
                 # If IOs binary changed and PLC is running, we cannot hot-swap: must stop first
